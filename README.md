@@ -27,7 +27,7 @@ Execute the following command in the operating system:
 
 ```
 # git clone --depth=1 https://github.com/InnovoDeveloper/NanoHatOLED-Trixie.git
-# cd NanoHatOLED
+# cd NanoHatOLED-trixie
 # sudo -H ./install-trixie.sh
 ```
 
