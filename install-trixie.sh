@@ -11,6 +11,15 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Ensure BakeBit is present
+if [ ! -d "$SCRIPT_DIR/BakeBit/Software" ]; then
+  echo "BakeBit submodule missing; cloning..."
+  rm -rf "$SCRIPT_DIR/BakeBit"
+  git clone --depth=1 https://github.com/friendlyarm/BakeBit.git "$SCRIPT_DIR/BakeBit"
+fi
+
 # Install dependencies
 echo "Installing dependencies..."
 apt-get update
