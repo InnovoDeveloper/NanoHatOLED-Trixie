@@ -188,6 +188,7 @@ int isAlreadyRunning()
    ftruncate(fd, 0);
    sprintf(buf, "%ld", (long)getpid());
    write(fd, buf, strlen(buf)+1);
+   /* Keep the file descriptor open to maintain the lock */
    return (0);
 }
 

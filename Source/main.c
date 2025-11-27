@@ -47,6 +47,7 @@ THE SOFTWARE.
 
 extern void log2file(const char *fmt, ...);
 
+static volatile int keep_running = 1;
 
 int get_work_path(char* buff, int maxlen);
 
@@ -80,7 +81,10 @@ int main(int argc, char* argv[]) {
     if (isAlreadyRunning() == 1) {
         exit(3);
     }
-    daemonize("nanohat-oled");
+    // Don't daemonize when running under systemd - it handles process management
+    // daemonize("nanohat-oled");
+    
+    log2file("NanoHatOLED starting - PID: %d (NOT daemonized)\n", getpid());
 
     int ret = get_work_path(workpath, sizeof(workpath));
     if (ret != 0) {
@@ -138,8 +142,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Register signal handlers for clean shutdown
+    signal(SIGTERM, sig_handler);
+    signal(SIGINT, sig_handler);
+
     load_python_view(workpath);
-    while (1) {
+    while (keep_running) {
         n = epoll_wait(epfd, events, 10, 15);
 
         for (i = 0; i < n; ++i) {
@@ -173,6 +181,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    cleanup_and_exit();
     return 0;
 }
 
@@ -242,29 +251,37 @@ void release_gpio(int gpio) {
 }
 
 
-//// according signal to handle gpio fd
-//// NOTE: just a demo, but NOT use the function in this main.c
+//// signal handler for clean shutdown
 void sig_handler(int sig)
 {
-    if(sig == SIGINT){
-        if (epfd>=0) {
-            close(epfd);
-        }
-        if (fd_d0>=0) {
-            close(fd_d0);
-            release_gpio(gpio_d0);
-        }
-        if (fd_d1>=0) {
-            close(fd_d1);
-            release_gpio(gpio_d1);
-        }
-        if (fd_d2>=0) {
-            close(fd_d2);
-            release_gpio(gpio_d2);
-        }
-        log2file("ctrl+c has been keydown\n");
-        exit(0);
+    if(sig == SIGINT || sig == SIGTERM){
+        log2file("Received signal %d, shutting down...\n", sig);
+        keep_running = 0;
     }
+}
+
+void cleanup_and_exit() {
+    if (epfd>=0) {
+        close(epfd);
+    }
+    if (fd_d0>=0) {
+        close(fd_d0);
+        release_gpio(gpio_d0);
+    }
+    if (fd_d1>=0) {
+        close(fd_d1);
+        release_gpio(gpio_d1);
+    }
+    if (fd_d2>=0) {
+        close(fd_d2);
+        release_gpio(gpio_d2);
+    }
+    // Kill Python child process
+    if (view_thread_id != 0) {
+        send_signal_to_python_process(SIGTERM);
+        usleep(500000); // Give Python 500ms to exit gracefully
+    }
+    log2file("Cleanup complete, exiting\n");
 }
 
 
