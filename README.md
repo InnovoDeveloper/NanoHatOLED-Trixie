@@ -27,7 +27,7 @@ The original implementation was based on Python2.x, thanks to [CuitGGyy](https:/
 Execute the following command in the operating system:
 
 ```
-# git clone --depth=1 https://github.com/InnovoDeveloper/NanoHatOLED-Trixie
+# git clone --depth=1 git@github.com:InnovoDeveloper/NanoHatOLED-Trixie.git
 # cd NanoHatOLED
 # sudo -H ./install.sh
 ```
@@ -36,7 +36,7 @@ Execute the following command in the operating system:
 Execute the following command in the operating system:
 
 ```
-# git clone --depth=1 https://github.com/InnovoDeveloper/NanoHatOLED-Trixie
+# git clone --depth=1 git@github.com:InnovoDeveloper/NanoHatOLED-Trixie.git
 # cd NanoHatOLED
 # sudo -H ./install-compat.sh
 ```
