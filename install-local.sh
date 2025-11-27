@@ -16,27 +16,28 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-echo "[1/8] Installing system dependencies..."
-apt-get update
-apt-get install -y \
-    build-essential \
-    gcc \
-    python3 \
-    python3-pip \
-    python3-dev \
-    python3-pil \
-    python3-smbus \
-    i2c-tools \
-    git
-
-# Create Python symlink if needed
-if [ ! -f /usr/bin/python ]; then
-    ln -sf /usr/bin/python3 /usr/bin/python
-fi
-
-echo "[2/8] Upgrading Pillow for compatibility..."
-pip3 install pillow --upgrade --break-system-packages 2>/dev/null || \
-pip3 install pillow --upgrade 2>/dev/null || true
+# Commented out for testing - packages already installed
+# echo "[1/8] Installing system dependencies..."
+# apt-get update
+# apt-get install -y \
+#     build-essential \
+#     gcc \
+#     python3 \
+#     python3-pip \
+#     python3-dev \
+#     python3-pil \
+#     python3-smbus \
+#     i2c-tools \
+#     git
+# 
+# # Create Python symlink if needed
+# if [ ! -f /usr/bin/python ]; then
+#     ln -sf /usr/bin/python3 /usr/bin/python
+# fi
+# 
+# echo "[2/8] Upgrading Pillow for compatibility..."
+# pip3 install pillow --upgrade --break-system-packages 2>/dev/null || \
+# pip3 install pillow --upgrade 2>/dev/null || true
 
 echo "[3/8] Fixing WiringNP for modern GCC..."
 if [ -d "$SCRIPT_DIR/BakeBit/WiringNP" ]; then
@@ -195,25 +196,31 @@ Description=NanoHat OLED Display Service
 After=multi-user.target
 
 [Service]
-Type=forking
-PIDFile=/run/nanohat-oled.pid
+Type=simple
 WorkingDirectory=$SCRIPT_DIR
 ExecStartPre=/bin/sleep 2
 ExecStart=$SCRIPT_DIR/NanoHatOLED
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=30
-KillMode=process
+KillMode=control-group
+KillSignal=SIGTERM
+RemainAfterExit=no
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
 
-# Stop any existing instances before enabling
+# Aggressive cleanup of any existing instances
+echo "Cleaning up any existing service instances..."
 systemctl stop nanohat-oled.service 2>/dev/null || true
+systemctl kill nanohat-oled.service 2>/dev/null || true
+sleep 1
 killall -9 NanoHatOLED 2>/dev/null || true
 killall -9 python3 2>/dev/null || true
-sleep 1
+pkill -9 -f "bakebit_nanohat_oled.py" 2>/dev/null || true
+rm -f /var/run/nanohat-oled.pid 2>/dev/null || true
+sleep 2
 
 systemctl daemon-reload
 systemctl enable nanohat-oled.service
