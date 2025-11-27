@@ -22,6 +22,14 @@ The original implementation was based on Python2.x, thanks to [CuitGGyy](https:/
 
 
 ## Installation
+#### Dietpi Debian Trixie
+Execute the following command in the operating system:
+
+```
+# git clone --depth=1 git@github.com:InnovoDeveloper/NanoHatOLED-Trixie.git
+# cd NanoHatOLED
+# sudo -H ./install-trixie.sh
+```
 
 #### FriendlyCore Xenial / Armbian Stretch / Ubuntu Core Xenial
 Execute the following command in the operating system:
