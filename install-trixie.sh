@@ -1,94 +1,278 @@
 #!/bin/bash
 set -e
 
-echo "======================================"
-echo "NanoHat OLED Installer for Debian Trixie/Bookworm"
-echo "======================================"
+echo "========================================"
+echo "NanoHat OLED Local Installation Script"
+echo "For Debian Trixie/Bookworm"
+echo "========================================"
 
-# Check if running as root
-if [ "$EUID" -ne 0 ]; then 
-    echo "Please run as root (sudo)"
+# Get the directory where script is located (repo root)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Root check
+if [ "$EUID" -ne 0 ]; then
+    echo "Please run as root: sudo bash $0 [--install-pkg]"
     exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Ensure BakeBit is present
-if [ ! -d "$SCRIPT_DIR/BakeBit/Software" ]; then
-  echo "BakeBit submodule missing; cloning..."
-  rm -rf "$SCRIPT_DIR/BakeBit"
-  git clone --depth=1 https://github.com/friendlyarm/BakeBit.git "$SCRIPT_DIR/BakeBit"
+# -----------------------------
+# Parse command line arguments
+# -----------------------------
+INSTALL_PACKAGES=false
+if [ "${1:-}" == "--install-pkg" ]; then
+    INSTALL_PACKAGES=true
+    echo "Package installation enabled"
 fi
 
-# Install dependencies
-echo "Installing dependencies..."
-apt-get update
-apt-get install -y gcc python3 python3-pip python3-dev python3-pil python3-smbus i2c-tools git
+# -----------------------------
+# 1. System packages (optional)
+# -----------------------------
+if [ "$INSTALL_PACKAGES" = true ]; then
+    echo "[1/8] Installing system dependencies..."
+    apt-get update
+    apt-get install -y \
+        build-essential \
+        gcc \
+        python3 \
+        python3-pip \
+        python3-dev \
+        python3-pil \
+        python3-smbus \
+        i2c-tools \
+        git
 
-# Create python symlink if needed
-if [ ! -f /usr/bin/python ]; then
-    ln -sf /usr/bin/python3 /usr/bin/python
-fi
+    # Create /usr/bin/python symlink if needed
+    if [ ! -f /usr/bin/python ]; then
+        ln -sf /usr/bin/python3 /usr/bin/python
+    fi
 
-# Upgrade Pillow
-pip3 install pillow --upgrade --break-system-packages 2>/dev/null || pip3 install pillow --upgrade
-
-# Initialize submodules
-echo "Initializing submodules..."
-git submodule update --init --recursive
-
-# Clone and build WiringNP
-echo "Building WiringNP..."
-cd BakeBit
-if [ ! -d "WiringNP" ]; then
-    git clone https://github.com/friendlyarm/WiringNP
-fi
-cd WiringNP/wiringPi
-# Fix for newer GCC
-sed -i '2476s/return;/return -1;/' wiringPi.c 2>/dev/null || true
-cd ..
-chmod +x build
-./build clean
-./build || echo "Note: GPIO utility failed but library installed"
-ldconfig
-cd ../..
-
-# Compile the Trixie-compatible daemon
-echo "Compiling daemon..."
-if [ -f "Source/main_trixie.c" ]; then
-    gcc Source/main_trixie.c -o NanoHatOLED
+    echo "[2/8] Upgrading Pillow for compatibility..."
+    pip3 install pillow --upgrade --break-system-packages 2>/dev/null || \
+    pip3 install pillow --upgrade 2>/dev/null || true
 else
+    echo "[1/8] Skipping package installation (use --install-pkg to install)"
+    echo "[2/8] Skipping Pillow upgrade (use --install-pkg to upgrade)"
+fi
+
+# -----------------------------
+# 2. Fix WiringNP for modern GCC
+# -----------------------------
+echo "[3/8] Fixing WiringNP for modern GCC..."
+
+if [ -d "$SCRIPT_DIR/BakeBit/WiringNP" ]; then
+    cd "$SCRIPT_DIR/BakeBit/WiringNP/wiringPi"
+
+    # Restore original file if it was already modified before
+    if [ -f wiringPi.c.original ]; then
+        cp wiringPi.c.original wiringPi.c
+    else
+        cp wiringPi.c wiringPi.c.original
+    fi
+
+    echo "Applying GCC 12+ compatibility patches to wiringPi.c..."
+
+    # ---- Fix void functions: 'return -1;' -> 'return;' ----
+    sed -i '/^void sunxi_set_gpio_mode/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^void sunxi_digitalWrite/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^void sunxi_pullUpDnControl/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^void setPadDrive/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^void pwmSetMode/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^void pwmSetRange/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^void pwmSetClock/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^void gpioClockSet/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^static void pinModeDummy/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^static void pullUpDnControlDummy/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^static void digitalWriteDummy/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^static void pwmWriteDummy/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^static void analogWriteDummy/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^void pinModeAlt/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^void pinMode(/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^void pullUpDnControl(/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^void digitalWrite(/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^void pwmWrite/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^void analogWrite/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^void digitalWriteByte/,/^}/s/return -1;/return;/g' wiringPi.c
+    sed -i '/^void delayMicroseconds/,/^}/s/return -1;/return;/g' wiringPi.c
+
+    # ---- Fix int functions: bare 'return;' -> 'return -1;' ----
+    sed -i '/^int wiringPiFailure/,/^}/s/^\([[:space:]]*\)return;$/\1return -1;/g' wiringPi.c
+    sed -i '/^int wpiPinToGpio/,/^}/s/^\([[:space:]]*\)return;$/\1return -1;/g' wiringPi.c
+    sed -i '/^int physPinToGpio/,/^}/s/^\([[:space:]]*\)return;$/\1return -1;/g' wiringPi.c
+    sed -i '/^int physPinToPin/,/^}/s/^\([[:space:]]*\)return;$/\1return -1;/g' wiringPi.c
+    sed -i '/^int getAlt(/,/^}/s/^\([[:space:]]*\)return;$/\1return -1;/g' wiringPi.c
+    sed -i '/^int getAltSilence/,/^}/s/^\([[:space:]]*\)return;$/\1return -1;/g' wiringPi.c
+    sed -i '/^int waitForInterrupt/,/^}/s/^\([[:space:]]*\)return;$/\1return -1;/g' wiringPi.c
+    sed -i '/^int wiringPiISR/,/^}/s/^\([[:space:]]*\)return;$/\1return -1;/g' wiringPi.c
+    sed -i '/^int wiringPiSetup/,/^}/s/^\([[:space:]]*\)return;$/\1return -1;/g' wiringPi.c
+
+    cd "$SCRIPT_DIR/BakeBit/WiringNP"
+else
+    echo "ERROR: BakeBit/WiringNP not found! Make sure BakeBit is present in the repo."
+    exit 1
+fi
+
+echo "[4/8] Building WiringNP library..."
+cd "$SCRIPT_DIR/BakeBit/WiringNP"
+
+chmod +x build
+./build clean 2>/dev/null || true
+
+# If full build fails, fall back to library-only build
+if ! ./build 2>&1; then
+    echo "Note: Full build failed, trying library-only build..."
+    cd wiringPi
+    make clean || true
+    make
+    make install
+    cd ..
+fi
+
+# Verify library exists
+if [ -f /usr/local/lib/libwiringPi.so ] || [ -f /usr/lib/libwiringPi.so ]; then
+    echo "✓ WiringNP library built successfully"
+    ldconfig
+else
+    echo "ERROR: WiringNP library failed to build"
+    exit 1
+fi
+
+# -----------------------------
+# 3. Pillow 10+ fix for Python script
+# -----------------------------
+echo "[5/8] Fixing Python script for Pillow 10+..."
+cd "$SCRIPT_DIR/BakeBit/Software/Python"
+
+if [ ! -f bakebit_nanohat_oled.py.original ]; then
+    cp bakebit_nanohat_oled.py bakebit_nanohat_oled.py.original
+fi
+
+python3 << 'PYFIX'
+import re
+
+try:
+    with open('bakebit_nanohat_oled.py', 'r') as f:
+        content = f.read()
+
+    if 'draw.textsize' in content:
+        print("Applying Pillow 10+ compatibility fix...")
+
+        # Pattern: w, h = draw.textsize(text, font=font)
+        content = re.sub(
+            r'(\w+),\s*(\w+)\s*=\s*draw\.textsize\((.*?),\s*font=(.*?)\)',
+            r'bbox = draw.textbbox((0, 0), \3, font=\4)\n'
+            r'        \1 = bbox[2] - bbox[0]\n'
+            r'        \2 = bbox[3] - bbox[1]',
+            content
+        )
+
+        # Pattern: w = draw.textsize(text, font=font)[0]
+        content = re.sub(
+            r'(\w+)\s*=\s*draw\.textsize\((.*?),\s*font=(.*?)\)\[0\]',
+            r'bbox = draw.textbbox((0, 0), \2, font=\3)\n'
+            r'        \1 = bbox[2] - bbox[0]',
+            content
+        )
+
+        with open('bakebit_nanohat_oled.py', 'w') as f:
+            f.write(content)
+        print("✓ Pillow compatibility fix applied")
+    else:
+        print("✓ Script already compatible (no draw.textsize calls)")
+except Exception as e:
+    print(f"Warning: Could not apply Pillow fix: {e}")
+PYFIX
+
+# -----------------------------
+# 4. Determine Python interpreter
+# -----------------------------
+echo "[6/8] Determining Python interpreter..."
+cd "$SCRIPT_DIR"
+
+if [ -L /usr/bin/python3 ]; then
+    PY3_INTERP=$(readlink /usr/bin/python3)
+else
+    PY3_INTERP="python3"
+fi
+
+echo "Using Python interpreter: $PY3_INTERP"
+
+if [ -f "$SCRIPT_DIR/Source/daemonize.h" ]; then
+    sed -i "s|#define PYTHON3_INTERP.*|#define PYTHON3_INTERP \"$PY3_INTERP\"|" "$SCRIPT_DIR/Source/daemonize.h"
+fi
+
+# -----------------------------
+# 5. Compile NanoHatOLED daemon
+# -----------------------------
+echo "[7/8] Compiling NanoHatOLED daemon..."
+cd "$SCRIPT_DIR"
+
+if [ -f "Source/main_trixie.c" ]; then
+    echo "Using Source/main_trixie.c"
+    gcc Source/daemonize.c Source/main_trixie.c -lrt -lpthread -o NanoHatOLED
+else
+    echo "Using Source/main.c"
     gcc Source/daemonize.c Source/main.c -lrt -lpthread -o NanoHatOLED
 fi
 
-# Create systemd service
-echo "Creating systemd service..."
-cat > /etc/systemd/system/nanohat-oled.service << 'SERVICE'
+echo "✓ Daemon compiled successfully"
+
+# -----------------------------
+# 6. Create systemd service
+# -----------------------------
+echo "[8/8] Creating systemd service..."
+
+cat > /etc/systemd/system/nanohat-oled.service << SVCEOF
 [Unit]
-Description=NanoHat OLED Display
+Description=NanoHat OLED Display Service (Trixie-compatible)
 After=multi-user.target
 
 [Service]
 Type=forking
-PIDFile=/var/run/nanohat-oled.pid
-ExecStart=$(pwd)/NanoHatOLED
+PIDFile=/run/nanohat-oled.pid
+WorkingDirectory=$SCRIPT_DIR
+ExecStartPre=/bin/sleep 2
+ExecStart=$SCRIPT_DIR/NanoHatOLED
 Restart=on-failure
-RestartSec=5
+RestartSec=10
+TimeoutStartSec=30
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target
-SERVICE
+SVCEOF
 
-# Update service path
-sed -i "s|\$(pwd)|$(pwd)|g" /etc/systemd/system/nanohat-oled.service
+# Stop any existing instances before enabling
+systemctl stop nanohat-oled.service 2>/dev/null || true
+killall -9 NanoHatOLED 2>/dev/null || true
+killall -9 python3 2>/dev/null || true
+sleep 1
 
-# Enable and start service
 systemctl daemon-reload
 systemctl enable nanohat-oled.service
-systemctl start nanohat-oled.service
 
-echo "======================================"
-echo "Installation complete!"
-echo "Check status: systemctl status nanohat-oled.service"
-echo "Test buttons: K1 (toggle), K2 (select), K3 (menu)"
-echo "======================================"
+echo ""
+echo "========================================"
+echo "Installation Complete!"
+echo "========================================"
+echo ""
+echo "Installation directory: $SCRIPT_DIR"
+echo ""
+echo "Usage:"
+echo "  sudo bash install-trixie.sh          # Reinstall (skip package installation)"
+echo "  sudo bash install-trixie.sh --install-pkg  # Full install with packages"
+echo ""
+echo "To start the service:"
+echo "  systemctl start nanohat-oled.service"
+echo ""
+echo "To check status:"
+echo "  systemctl status nanohat-oled.service"
+echo ""
+echo "To view logs:"
+echo "  journalctl -fu nanohat-oled.service"
+echo ""
+echo "To test buttons manually (if your build logs events):"
+echo "  tail -f /var/log/oled.log"
+echo ""
+echo "On first boot, ensure I2C is enabled and /dev/i2c-* exists."
+echo ""
