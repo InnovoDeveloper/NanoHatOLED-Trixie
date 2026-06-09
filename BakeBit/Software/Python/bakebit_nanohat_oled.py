@@ -236,6 +236,17 @@ def get_ip_address(ifname):
     except:
         return "N/A"
 
+def get_mac_address(ifname='eth0'):
+    try:
+        with open(f'/sys/class/net/{ifname}/address', 'r') as f:
+            return f.read().strip().upper()
+    except:
+        try:
+            with open('/sys/class/net/wlan0/address', 'r') as f:
+                return f.read().strip().upper()
+        except:
+            return "N/A"
+
 def get_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -346,6 +357,10 @@ def draw_page():
             draw.text((2, 50), NOWPLAYING, font=smartFont, fill=255)
 
     # --- Page 1: System Info ---
+    # Layout (64px tall): IP on top, MAC big+bold directly under it (the MAC is
+    # the field installers read off the screen, so give it the most weight), then
+    # CPU load + temp share one line to free the vertical space the bigger MAC
+    # takes, with Mem/Disk on the final line.
     elif page_index == 1:
         try:
             IPAddress = get_ip_address('eth0')
@@ -354,37 +369,58 @@ def draw_page():
         except:
             IPAddress = get_ip()
 
+        MACAddress = get_mac_address('eth0')
+
+        # CPU load average (1-min), kept short so it fits beside the temp.
         try:
-            cmd = "top -bn1 | grep load | awk '{printf \"CPU Load: %.2f\", $(NF-2)}'"
-            CPU = subprocess.check_output(cmd, shell=True, timeout=2).decode('utf-8')
+            cmd = "awk '{printf \"%.2f\", $1}' /proc/loadavg"
+            cpu_load = subprocess.check_output(cmd, shell=True, timeout=2).decode('utf-8').strip()
+            if not cpu_load:
+                cpu_load = "N/A"
         except:
-            CPU = "CPU Load: N/A"
-            
+            cpu_load = "N/A"
+
         try:
-            cmd = "free -m | awk 'NR==2{printf \"Mem: %s/%sMB %.2f%%\", $3,$2,$3*100/$2 }'"
-            MemUsage = subprocess.check_output(cmd, shell=True, timeout=2).decode('utf-8')
+            cmd = "free | awk 'NR==2{printf \"%d\", $3*100/$2}'"
+            mem_usage = subprocess.check_output(cmd, shell=True, timeout=2).decode('utf-8').strip()
+            if not mem_usage:
+                mem_usage = "N/A"
         except:
-            MemUsage = "Mem: N/A"
-            
+            mem_usage = "N/A"
+
         try:
-            cmd = "df -h | awk '$NF==\"/\"{printf \"Disk: %d/%dGB %s\", $3,$2,$5}'"
-            Disk = subprocess.check_output(cmd, shell=True, timeout=2).decode('utf-8')
+            cmd = "df -h | awk '$NF==\"/\"{print $5}' | sed 's/%//'"
+            disk_usage = subprocess.check_output(cmd, shell=True, timeout=2).decode('utf-8').strip()
+            if not disk_usage:
+                disk_usage = "N/A"
         except:
-            Disk = "Disk: N/A"
-            
+            disk_usage = "N/A"
+
         try:
             tempI = int(open('/sys/class/thermal/thermal_zone0/temp').read())
             if tempI > 1000:
                 tempI = tempI / 1000
-            tempStr = f"CPU TEMP: {int(tempI)}C"
+            temp_c = int(tempI)
+            temp = f"{temp_c}C"
+            temp_flash = temp_c >= 80   # flash the line only when critical
         except:
-            tempStr = "CPU TEMP: N/A"
+            temp = "N/A"
+            temp_flash = False
 
-        draw.text((0, 5), f"IP: {IPAddress}", font=smartFont, fill=255)
-        draw.text((0, 17), CPU, font=smartFont, fill=255)
-        draw.text((0, 29), MemUsage, font=smartFont, fill=255)
-        draw.text((0, 41), Disk, font=smartFont, fill=255)
-        draw.text((0, 53), tempStr, font=smartFont, fill=255)
+        # IP address (regular 14) on top.
+        draw.text((2, 0), IPAddress, font=font14, fill=255)
+
+        # MAC address directly under the IP, bold 12 (the widest a full 17-char
+        # MAC fits on a 128px line) so it stands out from the IP above it.
+        draw.text((2, 17), MACAddress, font=fontb12, fill=255)
+
+        # CPU load + temp on ONE line. Suppress on the flash-off half-second when
+        # the temp is critical, so the whole stats line blinks as a warning.
+        if not (temp_flash and int(time.time()) % 2 == 0):
+            draw.text((2, 34), f"CPU:{cpu_load} T:{temp}", font=font10, fill=255)
+
+        # Mem + Disk on the final line.
+        draw.text((2, 50), f"Mem:{mem_usage}% Disk:{disk_usage}%", font=font10, fill=255)
 
     # --- Page 2: System Options ---
     elif page_index == SYSTEM_OPTIONS_PAGE:
