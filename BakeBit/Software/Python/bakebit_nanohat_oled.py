@@ -40,6 +40,32 @@ logging.info("Starting OLED script...")
 VOLUME_STEP = 5            # percent per button press
 VOLUME_CARD = "0"          # card 0 = H3 codec = aux zone
 VOLUME_CONTROL = "DAC"     # codec digital playback volume feeding aux Line Out
+
+# --- RCA (HiFi) zone: NO ALSA control by design (softvol on the PCM5102A I2S
+# path causes static -- see /etc/asound.conf). RCA volume is controlled
+# server-side in LMS instead, on the primary Squeezelite player.
+RCA_LMS_HOST = "192.168.0.68"
+RCA_LMS_PORT = 9000
+RCA_LMS_PLAYERID = "06:52:07:ba:4b:16"   # primary (RCA/HiFi) Squeezelite player
+_rca_level = 0
+
+# --- Page indices (named so the handlers read clearly) ---
+SYSTEM_OPTIONS_PAGE = 2     # was "Power Options"
+AUX_VOLUME_PAGE = 10
+RCA_VOLUME_PAGE = 11
+RESET_AUDIO_PAGE = 12
+FACTORY_CONFIRM_PAGE = 13
+FACTORY_PROGRESS_PAGE = 14
+VOLUME_MENU_PAGE = 15
+
+# Order of items on the System Options menu (page 2). Index positions are
+# referenced by the K2/confirm handler below, so keep them in sync.
+SYSTEM_OPTIONS = ["Reboot", "Shutdown", "Reset Network", "Reset Audio", "Factory Reset"]
+
+# --- Device scripts / services for the audio resets + factory reset ---
+I2S_RESET_SH = "/mnt/dietpi_userdata/innovo/app/backend/wrappers/i2s-reset.sh"
+FACTORY_RESET_SH = "/mnt/dietpi_userdata/innovo/app/backend/cgi-scripts/factory_reset.sh"
+AUX_SERVICES = ["squeezelite-secondary", "raspotify-secondary", "shairport-sync-secondary"]
 _volume_level = 0          # last-known volume percent, for the on-screen bar
 
 def _amixer(*args, timeout=2):
@@ -104,13 +130,72 @@ def change_volume(delta):
         logging.warning(f"change_volume failed: {e}")
     return _volume_level
 
+def _lms_request(params, timeout=4):
+    """POST a JSON-RPC slim.request to the LMS server. Returns the parsed
+    'result' dict, or None on any failure (network down, bad JSON, etc.)."""
+    import json, urllib.request
+    body = json.dumps({"id": 1, "method": "slim.request", "params": params}).encode()
+    url = f"http://{RCA_LMS_HOST}:{RCA_LMS_PORT}/jsonrpc.js"
+    try:
+        req = urllib.request.Request(url, data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode()).get("result")
+    except Exception as e:
+        logging.warning(f"LMS request failed ({params}): {e}")
+        return None
+
+def get_rca_volume():
+    global _rca_level
+    res = _lms_request([RCA_LMS_PLAYERID, ["mixer", "volume", "?"]])
+    if res and "_volume" in res:
+        try:
+            _rca_level = int(float(res["_volume"]))
+        except (TypeError, ValueError):
+            pass
+    return _rca_level
+
+def change_rca_volume(delta):
+    """Adjust the RCA/HiFi zone volume via LMS server-side mixer (relative)."""
+    global _rca_level
+    sign = "+" if delta >= 0 else "-"
+    res = _lms_request([RCA_LMS_PLAYERID, ["mixer", "volume", f"{sign}{abs(delta)}"]])
+    # LMS doesn't echo the new level on a relative set; read it back.
+    return get_rca_volume()
+
+def reset_rca_audio():
+    """RCA/HiFi zone audio reset = re-run the I2S subsystem reset wrapper."""
+    logging.info("Reset Audio: RCA zone (i2s-reset.sh)")
+    try:
+        subprocess.Popen([I2S_RESET_SH],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        logging.error(f"i2s-reset failed to launch: {e}")
+
+def reset_aux_audio():
+    """Aux zone audio reset = restart the secondary-zone audio services."""
+    logging.info("Reset Audio: Aux zone (restart secondary services)")
+    try:
+        subprocess.Popen(["systemctl", "restart"] + AUX_SERVICES,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        logging.error(f"aux service restart failed to launch: {e}")
+
+def run_factory_reset():
+    """Trigger the device factory-reset script (detached -- it reboots)."""
+    logging.info("Factory Reset: launching factory_reset.sh")
+    try:
+        subprocess.Popen(["bash", FACTORY_RESET_SH],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        logging.error(f"factory_reset.sh failed to launch: {e}")
+
 detect_volume_control()
 
 # Global variables
 width = 128
 height = 64
 pageCount = 3
-VOLUME_PAGE = 10
 pageIndex = 0
 showPageIndicator = False
 pageSleep = 50
@@ -118,6 +203,7 @@ pageSleepCountdown = pageSleep
 selectionIndex = 0  # Start with first item selected
 lastActivityTime = time.time()
 screenSleeping = False
+_ready = False  # True once the main loop is running; gates button actions during startup
 nowplaying_scroll_offset = 0
 
 # Initialize OLED
@@ -161,10 +247,32 @@ def get_ip():
         s.close()
     return IP
 
+def _panel_off():
+    """Power the OLED panel + charge pump off (true sleep). Falls back to
+    blanking the framebuffer on drivers without displayOff() (repo driver)."""
+    try:
+        if hasattr(oled, "displayOff"):
+            oled.displayOff()
+        else:
+            oled.clearDisplay()
+    except Exception as e:
+        logging.warning(f"_panel_off failed: {e}")
+
+def _panel_on():
+    """Power the OLED panel back on. Uses displayOn() (charge-pump reinit) when
+    available; otherwise just restores normal (non-inverted) display."""
+    try:
+        if hasattr(oled, "displayOn"):
+            oled.displayOn()
+        else:
+            oled.setNormalDisplay()
+    except Exception as e:
+        logging.warning(f"_panel_on failed: {e}")
+
 def wake_screen():
     global screenSleeping, pageSleepCountdown, lastActivityTime
     if screenSleeping:
-        oled.setNormalDisplay()
+        _panel_on()
         screenSleeping = False
     pageSleepCountdown = pageSleep
     lastActivityTime = time.time()
@@ -183,8 +291,9 @@ def draw_page():
 
     if pageSleepCountdown <= 1:
         if not screenSleeping:
-            # oled.clearDisplay()
+            _panel_off()
             screenSleeping = True
+            logging.info("Screen sleeping (panel off)")
         pageSleepCountdown = 0
         return
     pageSleepCountdown -= 1
@@ -277,17 +386,17 @@ def draw_page():
         draw.text((0, 41), Disk, font=smartFont, fill=255)
         draw.text((0, 53), tempStr, font=smartFont, fill=255)
 
-    # --- Page 2: Power Options ---
-    elif page_index == 2:
-        draw.text((2, 2), 'Power Options', font=fontb12, fill=255)
-        options = ['Reboot', 'Shutdown', 'Reset Network']
+    # --- Page 2: System Options ---
+    elif page_index == SYSTEM_OPTIONS_PAGE:
+        draw.text((2, 2), 'System Options', font=fontb12, fill=255)
+        options = SYSTEM_OPTIONS
         for i, option in enumerate(options):
-            y = 20 + i * 14
+            y = 14 + i * 10
             if sel_index == i:
-                draw.rectangle((2, y, width-4, y+12), outline=255, fill=255)
-                draw.text((4, y+1), option, font=font10, fill=0)
+                draw.rectangle((2, y, width-4, y+9), outline=255, fill=255)
+                draw.text((4, y), option, font=font10, fill=0)
             else:
-                draw.text((4, y+1), option, font=font10, fill=255)
+                draw.text((4, y), option, font=font10, fill=255)
 
     # --- Page 3: Reboot confirmation ---
     elif page_index == 3:
@@ -335,8 +444,15 @@ def draw_page():
             else:
                 draw.text((4, y+1), option, font=font10, fill=255)
 
-    # --- Page 10: Volume ---
-    elif page_index == VOLUME_PAGE:
+    # --- Page 15: Volume (zone picker) ---
+    elif page_index == VOLUME_MENU_PAGE:
+        draw.text((2, 2), 'Volume', font=fontb12, fill=255)
+        draw.text((4, 22), 'B1: RCA', font=font10, fill=255)
+        draw.text((4, 36), 'B2: Aux', font=font10, fill=255)
+        draw.text((4, 50), 'B3: Back', font=font10, fill=255)
+
+    # --- Page 10: Aux Volume ---
+    elif page_index == AUX_VOLUME_PAGE:
         draw.text((2, 2), 'Aux Volume', font=fontb12, fill=255)
         vol = get_volume()
         # Numeric percent
@@ -347,7 +463,45 @@ def draw_page():
         fill_w = int((bw - 2) * max(0, min(100, vol)) / 100)
         if fill_w > 0:
             draw.rectangle((bx + 1, by + 1, bx + 1 + fill_w, by + bh - 1), outline=255, fill=255)
-        draw.text((2, 50), 'K1 -  K2 +  K3 back', font=font10, fill=255)
+        draw.text((2, 50), 'B1 -  B2 +  B3 back', font=font10, fill=255)
+
+    # --- Page 11: RCA Volume (LMS server-side) ---
+    elif page_index == RCA_VOLUME_PAGE:
+        draw.text((2, 2), 'RCA Volume', font=fontb12, fill=255)
+        vol = get_rca_volume()
+        draw.text((96, 2), f"{vol:3d}%", font=fontb12, fill=255)
+        bx, by, bw, bh = 4, 28, width - 8, 16
+        draw.rectangle((bx, by, bx + bw, by + bh), outline=255, fill=0)
+        fill_w = int((bw - 2) * max(0, min(100, vol)) / 100)
+        if fill_w > 0:
+            draw.rectangle((bx + 1, by + 1, bx + 1 + fill_w, by + bh - 1), outline=255, fill=255)
+        draw.text((2, 50), 'B1 -  B2 +  B3 back', font=font10, fill=255)
+
+    # --- Page 12: Reset Audio ---
+    elif page_index == RESET_AUDIO_PAGE:
+        draw.text((2, 2), 'Reset Audio', font=fontb12, fill=255)
+        draw.text((4, 22), 'B1: Reset RCA', font=font10, fill=255)
+        draw.text((4, 36), 'B2: Reset Aux', font=font10, fill=255)
+        draw.text((4, 50), 'B3: Back', font=font10, fill=255)
+
+    # --- Page 13: Factory Reset confirmation ---
+    elif page_index == FACTORY_CONFIRM_PAGE:
+        draw.text((2, 2), 'Factory Reset?', font=fontb12, fill=255)
+        options = ['Yes', 'No']
+        for i, option in enumerate(options):
+            y = 20 + i*14
+            if sel_index == i:
+                draw.rectangle((2, y, width-4, y+12), outline=255, fill=255)
+                draw.text((4, y+1), option, font=font10, fill=0)
+            else:
+                draw.text((4, y+1), option, font=font10, fill=255)
+        draw.text((2, 50), 'wipes to defaults', font=font10, fill=255)
+
+    # --- Page 14: Factory reset in progress ---
+    elif page_index == FACTORY_PROGRESS_PAGE:
+        draw.text((2, 2), 'Factory Reset', font=fontb12, fill=255)
+        draw.text((2, 22), 'Running...', font=font10, fill=255)
+        draw.text((2, 38), 'Device will reboot', font=font10, fill=255)
 
     # Clear and redraw
     # oled.clearDisplay()
@@ -369,8 +523,8 @@ def update_page_index(pi):
 def update_selection_index():
     global selectionIndex, lastActivityTime, pageIndex
     lock.acquire()
-    if pageIndex == 2:  # Power menu has 3 items
-        selectionIndex = (selectionIndex + 1) % 3
+    if pageIndex == SYSTEM_OPTIONS_PAGE:
+        selectionIndex = (selectionIndex + 1) % len(SYSTEM_OPTIONS)
     else:  # Yes/No dialogs have 2 items
         selectionIndex = (selectionIndex + 1) % 2
     lastActivityTime = time.time()
@@ -379,34 +533,51 @@ def update_selection_index():
 
 def receive_signal(signum, stack):
     global pageIndex, selectionIndex
-    
+
     logging.info(f"Received signal: {signum}")
     wake_screen()
+    if not _ready:
+        # Button pressed during startup -- handlers are installed early to avoid
+        # being killed by the default SIGUSR disposition, but we don't act on a
+        # press until the UI is fully up.
+        return
 
     lock.acquire()
     page_index = pageIndex
     sel_index = selectionIndex
     lock.release()
 
-    if signum == signal.SIGUSR1:  # Button K1 - Navigate/Select
-        if page_index in [2, 3, 5, 9]:  # In menu pages
-            update_selection_index()
+    if signum == signal.SIGUSR1:  # Button K1 - Navigate / RCA / Vol Down
+        if page_index in [SYSTEM_OPTIONS_PAGE, 3, 5, 9, FACTORY_CONFIRM_PAGE]:
+            update_selection_index()                 # move menu selection
         elif page_index == 0:
-            update_page_index(1)
+            update_page_index(1)                     # NowPlaying -> SysInfo
         elif page_index == 1:
-            update_page_index(VOLUME_PAGE)
-        elif page_index == VOLUME_PAGE:
-            change_volume(-VOLUME_STEP)
+            update_page_index(VOLUME_MENU_PAGE)      # SysInfo -> Volume picker
+        elif page_index == VOLUME_MENU_PAGE:
+            update_page_index(RCA_VOLUME_PAGE)       # picker: K1 = RCA zone
+        elif page_index == AUX_VOLUME_PAGE:
+            change_volume(-VOLUME_STEP)              # Aux vol down
+        elif page_index == RCA_VOLUME_PAGE:
+            change_rca_volume(-VOLUME_STEP)          # RCA vol down
+        elif page_index == RESET_AUDIO_PAGE:
+            reset_rca_audio()                        # K1 = Reset RCA
+            update_page_index(0)
         draw_page()
 
-    elif signum == signal.SIGUSR2:  # Button K2 - Confirm/Select
-        if page_index == 2:  # Power menu
-            if sel_index == 0:
-                update_page_index(3)  # Reboot confirm
-            elif sel_index == 1:
-                update_page_index(5)  # Shutdown confirm
-            else:
-                update_page_index(9)  # Reset network confirm
+    elif signum == signal.SIGUSR2:  # Button K2 - Confirm / Vol Up
+        if page_index == SYSTEM_OPTIONS_PAGE:  # System Options menu
+            choice = SYSTEM_OPTIONS[sel_index] if sel_index < len(SYSTEM_OPTIONS) else ""
+            if choice == "Reboot":
+                update_page_index(3)
+            elif choice == "Shutdown":
+                update_page_index(5)
+            elif choice == "Reset Network":
+                update_page_index(9)
+            elif choice == "Reset Audio":
+                update_page_index(RESET_AUDIO_PAGE)
+            elif choice == "Factory Reset":
+                update_page_index(FACTORY_CONFIRM_PAGE)
         elif page_index == 3:  # Reboot confirm
             if sel_index == 0:  # Yes
                 update_page_index(7)
@@ -429,23 +600,50 @@ def receive_signal(signum, stack):
                 update_page_index(0)
             else:  # No
                 update_page_index(0)
-        elif page_index == VOLUME_PAGE:  # Volume page
-            change_volume(VOLUME_STEP)
+        elif page_index == FACTORY_CONFIRM_PAGE:  # Factory Reset confirm
+            if sel_index == 0:  # Yes
+                update_page_index(FACTORY_PROGRESS_PAGE)
+                draw_page()
+                time.sleep(2)
+                run_factory_reset()
+            else:  # No
+                update_page_index(0)
+        elif page_index == VOLUME_MENU_PAGE:
+            update_page_index(AUX_VOLUME_PAGE)       # picker: K2 = Aux zone
+        elif page_index == AUX_VOLUME_PAGE:
+            change_volume(VOLUME_STEP)               # Aux vol up
+        elif page_index == RCA_VOLUME_PAGE:
+            change_rca_volume(VOLUME_STEP)           # RCA vol up
+        elif page_index == RESET_AUDIO_PAGE:
+            reset_aux_audio()                        # K2 = Reset Aux
+            update_page_index(0)
         else:
             update_page_index(0)
         draw_page()
 
-    elif signum == signal.SIGALRM:  # Button K3 - Menu/Back
-        if page_index == 2:
-            update_page_index(0)
-        elif page_index == VOLUME_PAGE:
-            update_page_index(1)  # back to System Info
+    elif signum == signal.SIGALRM:  # Button K3 - Menu / Back
+        if page_index == SYSTEM_OPTIONS_PAGE:
+            update_page_index(0)                     # close menu -> NowPlaying
+        elif page_index in [AUX_VOLUME_PAGE, RCA_VOLUME_PAGE]:
+            update_page_index(VOLUME_MENU_PAGE)      # zone page -> back to Volume picker
+        elif page_index == VOLUME_MENU_PAGE:
+            update_page_index(1)                     # Volume picker -> back to SysInfo
+        elif page_index in [RESET_AUDIO_PAGE, FACTORY_CONFIRM_PAGE]:
+            update_page_index(SYSTEM_OPTIONS_PAGE)   # back to System Options
         else:
-            update_page_index(2)
+            update_page_index(SYSTEM_OPTIONS_PAGE)   # open System Options
         draw_page()
 
 # Main execution
 try:
+    # Install signal handlers FIRST -- before any startup work (logo, sleeps).
+    # The default disposition of SIGUSR1/SIGUSR2 is to terminate the process, so
+    # a button press during startup would otherwise kill the OLED UI. receive_signal
+    # guards on `_ready` and safely ignores presses until the main loop is up.
+    signal.signal(signal.SIGUSR1, receive_signal)
+    signal.signal(signal.SIGUSR2, receive_signal)
+    signal.signal(signal.SIGALRM, receive_signal)
+
     # Display logo if it exists
     logo_path = 'innovo.png'
     if os.path.exists(logo_path):
@@ -453,13 +651,9 @@ try:
         image0 = Image.open(logo_path).convert('1')
         oled.drawImage(image0)
         time.sleep(2)
-        # oled.clearDisplay()
-
-    signal.signal(signal.SIGUSR1, receive_signal)
-    signal.signal(signal.SIGUSR2, receive_signal)
-    signal.signal(signal.SIGALRM, receive_signal)
 
     logging.info("Starting main loop...")
+    _ready = True
     while True:
         try:
             draw_page()
