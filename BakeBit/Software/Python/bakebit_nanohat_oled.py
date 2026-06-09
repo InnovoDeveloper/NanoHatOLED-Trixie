@@ -24,10 +24,90 @@ logging.basicConfig(
 
 logging.info("Starting OLED script...")
 
+# ============================================================
+# Volume control (ALSA hardware mixer via amixer)
+# ============================================================
+# The MC-Playum fleet has several different sound cards, so the simple-mixer
+# control name varies. We auto-detect a usable playback control once at startup
+# (trying the common names, then falling back to the first control amixer lists)
+# and cache it. All volume changes go through `amixer -M` so the steps follow a
+# perceptual (mapped) curve rather than a raw 0-100 linear one.
+
+VOLUME_STEP = 5          # percent per button press
+_volume_control = None   # resolved simple-mixer control name (e.g. "Master")
+_volume_level = 0        # last-known volume percent, for the on-screen bar
+
+def _amixer(*args, timeout=2):
+    return subprocess.check_output(
+        ["amixer", "-M"] + list(args),
+        stderr=subprocess.DEVNULL, timeout=timeout
+    ).decode("utf-8", "replace")
+
+def _parse_volume_percent(text):
+    # amixer prints e.g. "Front Left: Playback 200 [73%] [-12.00dB] [on]"
+    import re
+    m = re.search(r"\[(\d{1,3})%\]", text)
+    return int(m.group(1)) if m else None
+
+def detect_volume_control():
+    global _volume_control
+    candidates = ["Master", "PCM", "Digital", "Speaker", "Playback",
+                  "Headphone", "DAC", "HPOUT", "Lineout"]
+    try:
+        listing = _amixer("scontrols")
+    except Exception as e:
+        logging.warning(f"amixer scontrols failed: {e}")
+        listing = ""
+    available = []
+    for line in listing.splitlines():
+        # "Simple mixer control 'Master',0"
+        import re
+        m = re.search(r"'([^']+)'", line)
+        if m:
+            available.append(m.group(1))
+    for name in candidates:
+        if name in available:
+            _volume_control = name
+            break
+    if _volume_control is None and available:
+        _volume_control = available[0]
+    logging.info(f"Volume control: {_volume_control or 'NONE (volume disabled)'}")
+    return _volume_control
+
+def get_volume():
+    global _volume_level
+    if not _volume_control:
+        return _volume_level
+    try:
+        pct = _parse_volume_percent(_amixer("get", _volume_control))
+        if pct is not None:
+            _volume_level = pct
+    except Exception as e:
+        logging.warning(f"get_volume failed: {e}")
+    return _volume_level
+
+def change_volume(delta):
+    global _volume_level
+    if not _volume_control:
+        logging.warning("change_volume called but no mixer control detected")
+        return _volume_level
+    direction = "{}%+".format(abs(delta)) if delta >= 0 else "{}%-".format(abs(delta))
+    try:
+        out = _amixer("set", _volume_control, "unmute", direction)
+        pct = _parse_volume_percent(out)
+        if pct is not None:
+            _volume_level = pct
+    except Exception as e:
+        logging.warning(f"change_volume failed: {e}")
+    return _volume_level
+
+detect_volume_control()
+
 # Global variables
 width = 128
 height = 64
 pageCount = 3
+VOLUME_PAGE = 10
 pageIndex = 0
 showPageIndicator = False
 pageSleep = 50
@@ -252,6 +332,20 @@ def draw_page():
             else:
                 draw.text((4, y+1), option, font=font10, fill=255)
 
+    # --- Page 10: Volume ---
+    elif page_index == VOLUME_PAGE:
+        draw.text((2, 2), 'Volume', font=fontb12, fill=255)
+        vol = get_volume()
+        # Numeric percent
+        draw.text((96, 2), f"{vol:3d}%", font=fontb12, fill=255)
+        # Volume bar: outline + filled proportion
+        bx, by, bw, bh = 4, 28, width - 8, 16
+        draw.rectangle((bx, by, bx + bw, by + bh), outline=255, fill=0)
+        fill_w = int((bw - 2) * max(0, min(100, vol)) / 100)
+        if fill_w > 0:
+            draw.rectangle((bx + 1, by + 1, bx + 1 + fill_w, by + bh - 1), outline=255, fill=255)
+        draw.text((2, 50), 'K1 -  K2 +  K3 back', font=font10, fill=255)
+
     # Clear and redraw
     # oled.clearDisplay()
     oled.drawImage(image)
@@ -297,7 +391,9 @@ def receive_signal(signum, stack):
         elif page_index == 0:
             update_page_index(1)
         elif page_index == 1:
-            update_page_index(0)
+            update_page_index(VOLUME_PAGE)
+        elif page_index == VOLUME_PAGE:
+            change_volume(-VOLUME_STEP)
         draw_page()
 
     elif signum == signal.SIGUSR2:  # Button K2 - Confirm/Select
@@ -330,6 +426,8 @@ def receive_signal(signum, stack):
                 update_page_index(0)
             else:  # No
                 update_page_index(0)
+        elif page_index == VOLUME_PAGE:  # Volume page
+            change_volume(VOLUME_STEP)
         else:
             update_page_index(0)
         draw_page()
@@ -337,6 +435,8 @@ def receive_signal(signum, stack):
     elif signum == signal.SIGALRM:  # Button K3 - Menu/Back
         if page_index == 2:
             update_page_index(0)
+        elif page_index == VOLUME_PAGE:
+            update_page_index(1)  # back to System Info
         else:
             update_page_index(2)
         draw_page()
