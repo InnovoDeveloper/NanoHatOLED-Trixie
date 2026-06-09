@@ -44,9 +44,50 @@ VOLUME_CONTROL = "DAC"     # codec digital playback volume feeding aux Line Out
 # --- RCA (HiFi) zone: NO ALSA control by design (softvol on the PCM5102A I2S
 # path causes static -- see /etc/asound.conf). RCA volume is controlled
 # server-side in LMS instead, on the primary Squeezelite player.
+#
+# The LMS host and the RCA player id are PER-DEVICE: the player id is the
+# primary squeezelite player's MAC (its `-m` arg, == the board's eth0 MAC) and
+# the host is its `-s` arg. We auto-detect both from the running
+# `squeezelite-primary` (-o hifi) process so one script is correct on every
+# device; the constants below are only the fallback if detection fails.
 RCA_LMS_HOST = "192.168.0.68"
 RCA_LMS_PORT = 9000
-RCA_LMS_PLAYERID = "06:52:07:ba:4b:16"   # primary (RCA/HiFi) Squeezelite player
+RCA_LMS_PLAYERID = "06:52:07:ba:4b:16"   # fallback primary (RCA/HiFi) player
+
+def _detect_rca_lms():
+    """Read the primary squeezelite cmdline and pull out its player MAC (-m)
+    and LMS server (-s). The primary player is the RCA/HiFi zone (-o hifi).
+    Returns (playerid, host) or (None, None) if not found."""
+    try:
+        out = subprocess.check_output(
+            "ps -eo args 2>/dev/null | grep -E 'squeezelite[-]primary|squeezelite.*-o hifi' | grep -v grep",
+            shell=True, timeout=3).decode('utf-8', 'replace')
+    except Exception:
+        out = ""
+    playerid = host = None
+    for line in out.splitlines():
+        toks = line.split()
+        # -m is 6 space-separated hex bytes: -m 06 84 A7 E4 16 04
+        if '-m' in toks:
+            i = toks.index('-m')
+            mac = toks[i+1:i+7]
+            if len(mac) == 6 and all(len(b) == 2 for b in mac):
+                playerid = ':'.join(b.lower() for b in mac)
+        if '-s' in toks:
+            i = toks.index('-s')
+            if i + 1 < len(toks):
+                host = toks[i+1]
+        if playerid:
+            break
+    return playerid, host
+
+_pid, _host = _detect_rca_lms()
+if _pid:
+    RCA_LMS_PLAYERID = _pid
+if _host:
+    RCA_LMS_HOST = _host
+logging.info(f"RCA zone -> LMS {RCA_LMS_HOST}:{RCA_LMS_PORT} player {RCA_LMS_PLAYERID}")
+
 _rca_level = 0
 
 # --- Page indices (named so the handlers read clearly) ---
