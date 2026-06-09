@@ -25,61 +25,64 @@ logging.basicConfig(
 logging.info("Starting OLED script...")
 
 # ============================================================
-# Volume control (ALSA hardware mixer via amixer)
+# Volume control (ALSA hardware mixer -- Aux zone)
 # ============================================================
-# The MC-Playum fleet has several different sound cards, so the simple-mixer
-# control name varies. We auto-detect a usable playback control once at startup
-# (trying the common names, then falling back to the first control amixer lists)
-# and cache it. All volume changes go through `amixer -M` so the steps follow a
-# perceptual (mapped) curve rather than a raw 0-100 linear one.
+# This MC-Playum (NanoPi NEO / H3 codec) exposes TWO sound cards:
+#   card 0  H3 Audio Codec  -> the AUX zone (has mixer controls)
+#   card 1  I2S simple-card -> the RCA zone (NO mixer controls -- raw I2S)
+# So the buttons control the AUX zone only; the RCA zone has nothing to set.
+# The aux output volume is the codec's `DAC` control on card 0 (range 0-63),
+# which feeds the analog Line Out on the aux jack. We drive it with
+# `amixer -M` for perceptual (mapped) stepping. VOLUME_CARD/VOLUME_CONTROL are
+# the source of truth; auto-detect only runs as a fallback if `DAC` is absent
+# (e.g. a different codec on another unit).
 
-VOLUME_STEP = 5          # percent per button press
-_volume_control = None   # resolved simple-mixer control name (e.g. "Master")
-_volume_level = 0        # last-known volume percent, for the on-screen bar
+VOLUME_STEP = 5            # percent per button press
+VOLUME_CARD = "0"          # card 0 = H3 codec = aux zone
+VOLUME_CONTROL = "DAC"     # codec digital playback volume feeding aux Line Out
+_volume_level = 0          # last-known volume percent, for the on-screen bar
 
 def _amixer(*args, timeout=2):
     return subprocess.check_output(
-        ["amixer", "-M"] + list(args),
+        ["amixer", "-M", "-c", VOLUME_CARD] + list(args),
         stderr=subprocess.DEVNULL, timeout=timeout
     ).decode("utf-8", "replace")
 
 def _parse_volume_percent(text):
-    # amixer prints e.g. "Front Left: Playback 200 [73%] [-12.00dB] [on]"
+    # amixer prints e.g. "Front Left: Playback 58 [92%] [-5.80dB] [on]"
     import re
     m = re.search(r"\[(\d{1,3})%\]", text)
     return int(m.group(1)) if m else None
 
-def detect_volume_control():
-    global _volume_control
-    candidates = ["Master", "PCM", "Digital", "Speaker", "Playback",
-                  "Headphone", "DAC", "HPOUT", "Lineout"]
+def _control_exists(name):
     try:
-        listing = _amixer("scontrols")
-    except Exception as e:
-        logging.warning(f"amixer scontrols failed: {e}")
-        listing = ""
-    available = []
-    for line in listing.splitlines():
-        # "Simple mixer control 'Master',0"
-        import re
-        m = re.search(r"'([^']+)'", line)
-        if m:
-            available.append(m.group(1))
-    for name in candidates:
-        if name in available:
-            _volume_control = name
-            break
-    if _volume_control is None and available:
-        _volume_control = available[0]
-    logging.info(f"Volume control: {_volume_control or 'NONE (volume disabled)'}")
-    return _volume_control
+        _amixer("sget", name)
+        return True
+    except Exception:
+        return False
+
+def detect_volume_control():
+    # Prefer the known aux-zone control; only fall back if it's missing.
+    global VOLUME_CONTROL
+    if _control_exists(VOLUME_CONTROL):
+        logging.info(f"Volume control: card {VOLUME_CARD} '{VOLUME_CONTROL}' (aux zone)")
+        return VOLUME_CONTROL
+    logging.warning(f"'{VOLUME_CONTROL}' not found on card {VOLUME_CARD}; auto-detecting a playback control")
+    for name in ("Line Out", "PCM", "Master", "Digital", "Speaker"):
+        if _control_exists(name):
+            VOLUME_CONTROL = name
+            logging.info(f"Volume control fallback: '{name}'")
+            return name
+    logging.warning("no usable playback control found; volume control disabled")
+    VOLUME_CONTROL = None
+    return None
 
 def get_volume():
     global _volume_level
-    if not _volume_control:
+    if not VOLUME_CONTROL:
         return _volume_level
     try:
-        pct = _parse_volume_percent(_amixer("get", _volume_control))
+        pct = _parse_volume_percent(_amixer("sget", VOLUME_CONTROL))
         if pct is not None:
             _volume_level = pct
     except Exception as e:
@@ -88,12 +91,12 @@ def get_volume():
 
 def change_volume(delta):
     global _volume_level
-    if not _volume_control:
-        logging.warning("change_volume called but no mixer control detected")
+    if not VOLUME_CONTROL:
+        logging.warning("change_volume called but no mixer control available")
         return _volume_level
     direction = "{}%+".format(abs(delta)) if delta >= 0 else "{}%-".format(abs(delta))
     try:
-        out = _amixer("set", _volume_control, "unmute", direction)
+        out = _amixer("sset", VOLUME_CONTROL, "unmute", direction)
         pct = _parse_volume_percent(out)
         if pct is not None:
             _volume_level = pct
@@ -334,7 +337,7 @@ def draw_page():
 
     # --- Page 10: Volume ---
     elif page_index == VOLUME_PAGE:
-        draw.text((2, 2), 'Volume', font=fontb12, fill=255)
+        draw.text((2, 2), 'Aux Volume', font=fontb12, fill=255)
         vol = get_volume()
         # Numeric percent
         draw.text((96, 2), f"{vol:3d}%", font=fontb12, fill=255)
