@@ -823,17 +823,14 @@ def draw_page():
             draw.rectangle((bx + 1, by + 1, bx + 1 + fill_w, by + bh - 1), outline=255, fill=255)
         draw.text((2, 50), 'B1 -  B2 +  B3 back', font=font10, fill=255)
 
-    # --- Page 11: RCA Volume (LMS server-side) ---
+    # --- Page 11: RCA Volume (FIXED - no adjustment) ---
+    # The RCA/HiFi zone is raw I2S (PCM5102A) with no usable volume control, so
+    # the level is fixed. We keep the screen (so the zone picker stays symmetric)
+    # but show that it's fixed instead of a % + bar. B1/B2 do nothing here.
     elif page_index == RCA_VOLUME_PAGE:
         draw.text((2, 2), 'RCA Volume', font=fontb12, fill=255)
-        vol = get_rca_volume()
-        draw.text((96, 2), f"{vol:3d}%", font=fontb12, fill=255)
-        bx, by, bw, bh = 4, 28, width - 8, 16
-        draw.rectangle((bx, by, bx + bw, by + bh), outline=255, fill=0)
-        fill_w = int((bw - 2) * max(0, min(100, vol)) / 100)
-        if fill_w > 0:
-            draw.rectangle((bx + 1, by + 1, bx + 1 + fill_w, by + bh - 1), outline=255, fill=255)
-        draw.text((2, 50), 'B1 -  B2 +  B3 back', font=font10, fill=255)
+        draw.text((2, 26), 'Volume is Fixed', font=fontb12, fill=255)
+        draw.text((2, 50), 'B3 back', font=font10, fill=255)
 
     # --- Page 12: Reset Audio ---
     elif page_index == RESET_AUDIO_PAGE:
@@ -947,7 +944,7 @@ def receive_signal(signum, stack):
         elif page_index == AUX_VOLUME_PAGE:
             change_volume(-VOLUME_STEP)              # Aux vol down
         elif page_index == RCA_VOLUME_PAGE:
-            change_rca_volume(-VOLUME_STEP)          # RCA vol down
+            pass                                     # RCA volume is fixed - no-op
         elif page_index == RESET_AUDIO_PAGE:
             reset_rca_audio()                        # K1 = Reset RCA
             update_page_index(PAGE_DATE)
@@ -1027,7 +1024,7 @@ def receive_signal(signum, stack):
         elif page_index == AUX_VOLUME_PAGE:
             change_volume(VOLUME_STEP)               # Aux vol up
         elif page_index == RCA_VOLUME_PAGE:
-            change_rca_volume(VOLUME_STEP)           # RCA vol up
+            pass                                     # RCA volume is fixed - no-op
         elif page_index == RESET_AUDIO_PAGE:
             reset_aux_audio()                        # K2 = Reset Aux
             update_page_index(PAGE_DATE)
