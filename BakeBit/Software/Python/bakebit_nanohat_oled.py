@@ -114,11 +114,15 @@ STATUS_PAGE            = 18  # read-only: cloud/registered/dealer/id (NO IP/MAC 
 SELFHEAL_PROGRESS_PAGE = 21  # "Repairing..." -> "Done"/"Failed"
 # --- compatibility only, NEVER navigated to from the shutdown handler ---
 SAFE_TO_UNPLUG_PAGE    = 20  # golden's old "Safe to unplug" (external hook draws the real one)
+# --- Read-only filesystem recovery (SD corruption -> ext4 emergency_ro) ---
+PAGE_RO_WARNING        = 22  # auto-shown when / goes read-only (SD corruption)
+PAGE_RO_FIX_CONFIRM    = 23  # "Repair & reboot? Yes/No"
+PAGE_RO_FIXING         = 24  # "Scheduling fsck / rebooting..."
 
 # --- Menu item lists (index positions referenced by the K2 handlers; keep in sync) ---
 TOP_MENU = ["Volume", "Power & Reset", "Diagnostics"]
 POWER_RESET_MENU = ["Reboot", "Shutdown", "Reset Network", "Reset Audio", "Factory Reset"]
-DIAGNOSTICS_MENU = ["Self-Heal", "Restart Audio", "Restart Cloud"]
+DIAGNOSTICS_MENU = ["Repair System", "Restart Audio", "Restart Cloud"]
 
 # How many scrollable items each menu/confirm page has (drives K1 wrap).
 MENU_LENS = {
@@ -344,6 +348,123 @@ def run_self_heal():
         _selfheal_result = 1
         logging.error(f"Self-Heal thread failed to start: {e}")
 
+# --- Read-only filesystem detection + button-triggered repair ----------------
+# H3 SD cards occasionally corrupt on-card; ext4 detects a bad block (usually a
+# directory-block checksum failure, EFSBADCRC) and REMOUNTS ROOT READ-ONLY to
+# stop further damage (mount option 'emergency_ro'). The device keeps running
+# from RAM (audio + MCUI stay up) but NOTHING can be written to disk, so it's
+# silently broken until someone notices. We can't fsck a mounted root in place,
+# but we CAN, entirely from RAM / on the raw block device:
+#   1. detect the RO state by reading /proc/mounts (no disk access needed), and
+#   2. flag a forced fsck for next boot via `tune2fs -C` on the BLOCK DEVICE
+#      (writes to the device node, not the RO filesystem — works while RO), then
+#      `reboot -f` (needs no writable fs). fsck runs pre-mount on boot, repairs
+#      the corruption, and root comes back rw. This is the exact manual sequence
+#      proven on .116 (2026-07-26), automated behind a confirm-gated button.
+
+def _root_block_device():
+    """Return the block device backing / (e.g. /dev/mmcblk0p1). RAM-only read."""
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 2 and p[1] == "/":
+                    return p[0]
+    except Exception:
+        pass
+    return "/dev/mmcblk0p1"  # sane default for these H3 units
+
+def is_root_readonly():
+    """True if / is mounted read-only (ext4 emergency_ro or a plain ro mount).
+    Reads /proc/mounts only — safe and reliable even when the disk is fully RO."""
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 4 and p[1] == "/":
+                    opts = p[3].split(",")
+                    # ext4 emergency_ro reports 'ro' in the effective options.
+                    return ("ro" in opts) or ("emergency_ro" in opts)
+    except Exception:
+        return False
+    return False
+
+_ro_fix_result = None  # None=not started, set by worker (we reboot, so rarely read)
+
+def run_ro_fix():
+    """Schedule a forced fsck on next boot and reboot. Every step here is
+    RO-safe: sync flushes RAM, tune2fs -C writes the raw block device, reboot -f
+    bypasses systemd/dbus (which may itself be wedged by the RO root)."""
+    global _ro_fix_result
+    _ro_fix_result = None
+    dev = _root_block_device()
+    logging.warning(f"RO-FIX: scheduling forced fsck on {dev} + reboot")
+    def _step(desc, argv, tmo):
+        # Run one prep step, but NEVER let it block the reboot. Each step is
+        # individually guarded + timeout-bounded: on a badly-wedged device a
+        # single hung command (e.g. sync on a stuck I/O queue) must not stop us
+        # from getting to the guaranteed kernel reboot below.
+        try:
+            subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=tmo)
+            logging.info(f"RO-FIX: {desc} ok")
+        except Exception as e:
+            logging.warning(f"RO-FIX: {desc} failed/timed out ({e}) — continuing")
+
+    def _worker():
+        global _ro_fix_result
+        # Prep steps — each isolated so one hang can't abort the reboot.
+        # -C 100 sets mount count > max so fsck is FORCED next boot (writes the
+        # superblock on the DEVICE NODE, allowed while ro).
+        _step("tune2fs force-fsck", ["tune2fs", "-C", "100", dev], 15)
+        _step("tune2fs max-count",  ["tune2fs", "-c", "1", dev], 15)
+        # Recovery breadcrumb: ext4 LABEL RECOVER-RO on the block device
+        # (RO-safe, survives reboot, fsck does NOT clear it; fstab mounts by
+        # UUID so the label is inert to boot). innovo-post-ro-repair reads it
+        # next boot, runs the file/package repair, then clears it.
+        _step("set RECOVER-RO label", ["e2label", dev, "RECOVER-RO"], 15)
+        _step("sync", ["sync"], 8)
+        _ro_fix_result = 0
+        time.sleep(2)
+
+        # REBOOT — kernel sysrq FIRST, because it is the ONLY path that cannot
+        # stall: it needs no fork, no exec of a disk binary, no writable fs —
+        # just a write to a kernel interface. `reboot -f` (which must exec
+        # /sbin/reboot off a possibly-hung RO disk) was observed to WEDGE on a
+        # severely-stuck device (.23, 2026-07-27: stuck on 'Rebooting' screen,
+        # needed a manual power cycle). Enable sysrq, then s(ync) u(nmount-ro)
+        # b(oot). If sysrq is unavailable we fall through to reboot -f.
+        try:
+            # 1 = enable all sysrq functions (often restricted to 0/limited).
+            with open("/proc/sys/kernel/sysrq", "w") as f:
+                f.write("1")
+        except Exception as e:
+            logging.warning(f"RO-FIX: could not enable sysrq ({e})")
+        try:
+            for ch in ("s", "u", "b"):   # sync, remount-ro, reboot
+                try:
+                    with open("/proc/sysrq-trigger", "w") as s:
+                        s.write(ch)
+                    time.sleep(0.5)
+                except Exception as e:
+                    logging.warning(f"RO-FIX: sysrq '{ch}' failed ({e})")
+            # If sysrq 'b' didn't take effect within a moment, hard-fallback.
+            time.sleep(3)
+        except Exception as e:
+            logging.error(f"RO-FIX: sysrq reboot path errored ({e})")
+        # Fallback: only reached if sysrq did not reboot us.
+        logging.warning("RO-FIX: sysrq did not reboot — falling back to reboot -f")
+        try:
+            subprocess.run(["reboot", "-f"], timeout=10)
+        except Exception as e:
+            logging.error(f"RO-FIX: reboot -f also failed ({e}) — device may need manual power cycle")
+            _ro_fix_result = 1
+
+    try:
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception as e:
+        _ro_fix_result = 1
+        logging.error(f"RO-FIX thread failed to start: {e}")
+
 detect_volume_control()
 
 # Global variables
@@ -360,6 +481,17 @@ screenSleeping = False
 _ready = False  # True once the main loop is running; gates button actions during startup
 nowplaying_scroll_offset = 0
 sleepStartTime = 0  # Track when sleep started
+
+# --- Factory-reset "hold to confirm" state -----------------------------------
+# The button C-binary only sends discrete presses (no hold duration), so we make
+# factory reset deliberate by requiring K2 to be pressed FACTORY_CONFIRM_PRESSES
+# times in a row (with 'Yes' selected) within FACTORY_CONFIRM_WINDOW seconds.
+# Any other key, leaving the page, or a timeout resets the counter. Combined with
+# the confirm page defaulting to 'No', a single stray press can never wipe.
+FACTORY_CONFIRM_PRESSES = 3     # K2 presses on 'Yes' required to actually run
+FACTORY_CONFIRM_WINDOW = 5.0    # seconds; presses must be within this window
+factory_confirm_count = 0       # how many qualifying K2 presses so far
+factory_confirm_last = 0.0      # time.time() of the last qualifying press
 
 # Update lock file path
 UPDATE_LOCK_FILE = "/tmp/innovo_update.lock"
@@ -850,7 +982,21 @@ def draw_page():
                 draw.text((4, y+1), option, font=font10, fill=0)
             else:
                 draw.text((4, y+1), option, font=font10, fill=255)
-        draw.text((2, 50), 'wipes to defaults', font=font10, fill=255)
+        # Bottom line: when 'Yes' is selected, show the triple-press progress so
+        # the user knows a single press is not enough; otherwise the warning.
+        # A counter that has aged past the confirm window is shown as 0 (it will
+        # be reset on the next press anyway).
+        _fc = factory_confirm_count
+        if _fc > 0 and (time.time() - factory_confirm_last) > FACTORY_CONFIRM_WINDOW:
+            _fc = 0
+        if sel_index == 0 and _fc > 0:
+            draw.text((2, 50), 'Press Yes %d/%d' % (_fc,
+                      FACTORY_CONFIRM_PRESSES), font=font10, fill=255)
+        elif sel_index == 0:
+            draw.text((2, 50), 'Press Yes x%d' % FACTORY_CONFIRM_PRESSES,
+                      font=font10, fill=255)
+        else:
+            draw.text((2, 50), 'wipes to defaults', font=font10, fill=255)
 
     # --- Page 14: Factory reset in progress ---
     elif page_index == FACTORY_PROGRESS_PAGE:
@@ -858,9 +1004,9 @@ def draw_page():
         draw.text((2, 22), 'Running...', font=font10, fill=255)
         draw.text((2, 38), 'Device will reboot', font=font10, fill=255)
 
-    # --- Page 21: Self-Heal progress ---
+    # --- Page 21: Repair System progress ---
     elif page_index == SELFHEAL_PROGRESS_PAGE:
-        draw.text((2, 2), 'Self-Heal', font=fontb12, fill=255)
+        draw.text((2, 2), 'Repair System', font=fontb12, fill=255)
         if _selfheal_result is None:
             draw.text((2, 24), 'Repairing...', font=font10, fill=255)
             draw.text((2, 40), 'Please wait', font=font10, fill=255)
@@ -869,8 +1015,35 @@ def draw_page():
             draw.text((2, 50), 'B3: Back', font=font10, fill=255)
         else:
             draw.text((2, 24), 'Failed', font=fontb12, fill=255)
-            draw.text((2, 38), 'See self-heal log', font=font10, fill=255)
+            draw.text((2, 38), 'See repair log', font=font10, fill=255)
             draw.text((2, 50), 'B3: Back', font=font10, fill=255)
+
+    # --- Page 22: Read-only filesystem WARNING (auto-shown on SD corruption) ---
+    elif page_index == PAGE_RO_WARNING:
+        # Inverted header bar so it reads as an alert.
+        draw.rectangle((0, 0, width-1, 15), outline=255, fill=255)
+        draw.text((4, 2), 'DISK READ-ONLY', font=fontb12, fill=0)
+        draw.text((2, 20), 'SD error detected.', font=font10, fill=255)
+        draw.text((2, 34), 'Repair needs reboot.', font=font10, fill=255)
+        draw.text((2, 50), 'B2: Repair  B3: Skip', font=font10, fill=255)
+
+    # --- Page 23: Repair confirm (Yes/No) ---
+    elif page_index == PAGE_RO_FIX_CONFIRM:
+        draw.text((2, 2), 'Repair & reboot?', font=fontb12, fill=255)
+        options = ['Yes', 'No']
+        for i, option in enumerate(options):
+            y = 20 + i*14
+            if sel_index == i:
+                draw.rectangle((2, y, width-4, y+12), outline=255, fill=255)
+                draw.text((4, y+1), option, font=font10, fill=0)
+            else:
+                draw.text((4, y+1), option, font=font10, fill=255)
+
+    # --- Page 24: Repair in progress (device reboots) ---
+    elif page_index == PAGE_RO_FIXING:
+        draw.text((2, 2), 'Repairing disk', font=fontb12, fill=255)
+        draw.text((2, 24), 'Scheduling fsck', font=font10, fill=255)
+        draw.text((2, 40), 'Rebooting...', font=font10, fill=255)
 
     # Clear and redraw
     # oled.clearDisplay()
@@ -882,24 +1055,37 @@ def draw_page():
 
 def update_page_index(pi):
     global pageIndex, selectionIndex, lastActivityTime
+    global factory_confirm_count, factory_confirm_last
     lock.acquire()
     pageIndex = pi
-    selectionIndex = 0  # Reset selection to first item
+    # Factory Reset confirm defaults to 'No' (index 1 of ['Yes','No']) so a stray
+    # press can never land on Yes; every other page keeps first-item default.
+    selectionIndex = 1 if pi == FACTORY_CONFIRM_PAGE else 0
     lastActivityTime = time.time()
+    # Any page change (including entering or leaving the factory page) resets the
+    # triple-press confirm counter.
+    factory_confirm_count = 0
+    factory_confirm_last = 0.0
     lock.release()
     wake_screen()
 
 def update_selection_index():
     global selectionIndex, lastActivityTime, pageIndex
+    global factory_confirm_count, factory_confirm_last
     lock.acquire()
     n = MENU_LENS.get(pageIndex, 2)  # menus vary in length; default Yes/No = 2
     selectionIndex = (selectionIndex + 1) % n
     lastActivityTime = time.time()
+    # Scrolling the selection (e.g. Yes<->No) on the factory page restarts the
+    # triple-press confirm sequence.
+    if pageIndex == FACTORY_CONFIRM_PAGE:
+        factory_confirm_count = 0
+        factory_confirm_last = 0.0
     lock.release()
     wake_screen()
 
 def receive_signal(signum, stack):
-    global pageIndex, selectionIndex
+    global pageIndex, selectionIndex, factory_confirm_count, factory_confirm_last
 
     logging.info(f"Received signal: {signum}")
 
@@ -929,7 +1115,8 @@ def receive_signal(signum, stack):
         # Menu/confirm pages: scroll the selection.
         if page_index in (SYSTEM_OPTIONS_PAGE, POWER_RESET_MENU_PAGE, DIAGNOSTICS_MENU_PAGE,
                           PAGE_REBOOT_CONFIRM, PAGE_SHUTDOWN_CONFIRM,
-                          PAGE_RESET_NET_CONFIRM, FACTORY_CONFIRM_PAGE):
+                          PAGE_RESET_NET_CONFIRM, FACTORY_CONFIRM_PAGE,
+                          PAGE_RO_FIX_CONFIRM):
             update_selection_index()
         # Read-only info cycle: Date -> SysInfo -> Status -> (wrap) Date.
         elif page_index == PAGE_DATE:
@@ -973,7 +1160,7 @@ def receive_signal(signum, stack):
                 update_page_index(FACTORY_CONFIRM_PAGE)
         elif page_index == DIAGNOSTICS_MENU_PAGE:  # Diagnostics submenu
             choice = DIAGNOSTICS_MENU[sel_index] if sel_index < len(DIAGNOSTICS_MENU) else ""
-            if choice == "Self-Heal":
+            if choice == "Repair System":
                 run_self_heal()
                 update_page_index(SELFHEAL_PROGRESS_PAGE)
             elif choice == "Restart Audio":
@@ -1012,11 +1199,24 @@ def receive_signal(signum, stack):
             else:  # No
                 update_page_index(PAGE_DATE)
         elif page_index == FACTORY_CONFIRM_PAGE:  # Factory Reset confirm
-            if sel_index == 0:  # Yes
-                update_page_index(FACTORY_PROGRESS_PAGE)
-                draw_page()
-                time.sleep(2)
-                run_factory_reset()
+            if sel_index == 0:  # Yes -- require FACTORY_CONFIRM_PRESSES in a row
+                now = time.time()
+                # If the previous qualifying press was too long ago, start over.
+                if now - factory_confirm_last > FACTORY_CONFIRM_WINDOW:
+                    factory_confirm_count = 0
+                factory_confirm_count += 1
+                factory_confirm_last = now
+                if factory_confirm_count >= FACTORY_CONFIRM_PRESSES:
+                    factory_confirm_count = 0
+                    factory_confirm_last = 0.0
+                    update_page_index(FACTORY_PROGRESS_PAGE)
+                    draw_page()
+                    time.sleep(2)
+                    run_factory_reset()
+                else:
+                    # Not enough presses yet -- the confirm page render shows the
+                    # X/N counter; just redraw (draw_page at end of handler).
+                    pass
             else:  # No
                 update_page_index(PAGE_DATE)
         elif page_index == VOLUME_MENU_PAGE:
@@ -1028,6 +1228,15 @@ def receive_signal(signum, stack):
         elif page_index == RESET_AUDIO_PAGE:
             reset_aux_audio()                        # K2 = Reset Aux
             update_page_index(PAGE_DATE)
+        elif page_index == PAGE_RO_WARNING:          # K2 = Repair -> confirm
+            update_page_index(PAGE_RO_FIX_CONFIRM)
+        elif page_index == PAGE_RO_FIX_CONFIRM:      # K2 = confirm Yes/No
+            if sel_index == 0:                       # Yes
+                update_page_index(PAGE_RO_FIXING)
+                draw_page()
+                run_ro_fix()                         # schedules fsck + reboots
+            else:                                    # No
+                update_page_index(PAGE_RO_WARNING)   # back to the warning (RO persists)
         else:
             # Info pages: K2 opens the top menu.
             update_page_index(SYSTEM_OPTIONS_PAGE)
@@ -1047,6 +1256,13 @@ def receive_signal(signum, stack):
             update_page_index(VOLUME_MENU_PAGE)      # zone page -> Volume picker
         elif page_index == VOLUME_MENU_PAGE:
             update_page_index(SYSTEM_OPTIONS_PAGE)   # Volume picker -> top menu
+        elif page_index == PAGE_RO_FIX_CONFIRM:
+            update_page_index(PAGE_RO_WARNING)       # confirm -> back to warning
+        elif page_index == PAGE_RO_WARNING:
+            # K3 = Skip: dismiss to home. The main-loop RO guard re-shows the
+            # warning within ~3s if still read-only, so it can't be lost — this
+            # just lets the operator peek at other pages between alerts.
+            update_page_index(PAGE_DATE)
         elif page_index in (PAGE_DATE, PAGE_SYSINFO, STATUS_PAGE):
             update_page_index(SYSTEM_OPTIONS_PAGE)   # info page -> open top menu
         else:
@@ -1074,8 +1290,23 @@ try:
 
     logging.info("Starting main loop...")
     _ready = True
+    _ro_check_last = 0.0
     while True:
         try:
+            # Read-only-filesystem guard: poll every few seconds (cheap
+            # /proc/mounts read). If root goes RO (SD corruption -> ext4
+            # emergency_ro) FORCE the warning page so the operator sees it and
+            # can trigger the repair, overriding whatever page is up. Never
+            # steal focus while the user is already on the RO pages (warning /
+            # confirm / fixing) or mid-shutdown.
+            now = time.time()
+            if now - _ro_check_last >= 3.0:
+                _ro_check_last = now
+                if is_root_readonly() and pageIndex not in (
+                        PAGE_RO_WARNING, PAGE_RO_FIX_CONFIRM, PAGE_RO_FIXING,
+                        PAGE_SHUTTING_DOWN, PAGE_REBOOTING):
+                    wake_screen()
+                    update_page_index(PAGE_RO_WARNING)
             draw_page()
             # Redraw ~5x/sec so a button-driven page/selection change appears
             # near-instantly (a handler's redraw that got skipped by the drawing
