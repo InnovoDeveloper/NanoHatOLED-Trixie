@@ -25,70 +25,78 @@ logging.basicConfig(
 logging.info("Starting OLED script...")
 
 # ============================================================
-# Volume control (ALSA hardware mixer -- Aux zone)
+# Volume control (ALSA hardware mixer) -- N-ZONE AWARE
 # ============================================================
-# This MC-Playum (NanoPi NEO / H3 codec) exposes TWO sound cards:
-#   card 0  H3 Audio Codec  -> the AUX zone (has mixer controls)
-#   card 1  I2S simple-card -> the RCA zone (NO mixer controls -- raw I2S)
-# So the buttons control the AUX zone only; the RCA zone has nothing to set.
-# The aux output volume is the codec's `DAC` control on card 0 (range 0-63),
-# which feeds the analog Line Out on the aux jack. We drive it with
-# `amixer -M` for perceptual (mapped) stepping. VOLUME_CARD/VOLUME_CONTROL are
-# the source of truth; auto-detect only runs as a fallback if `DAC` is absent
-# (e.g. a different codec on another unit).
+# The OLED menu volume controls the ALSA HARDWARE MIXER of a zone (distinct from
+# the IR remote volume, which drives the per-zone LMS/squeezelite player level).
+# Zones and their sound cards come from the n-zone source of truth
+# /run/innovo/audio-cards.env (gen-asound.sh), NOT the old primary/secondary or
+# fixed card0/card1 assumptions. This makes the OLED correct on BOTH profiles:
+#   * Dual (RCA + Aux): Z1=Aux (H3 codec, HAS mixer) + Z2=RCA (I2S, NO mixer)
+#   * Single (Aux only): just Z1=Aux
+#
+# ONLY the Aux zone (H3 codec) has a usable ALSA playback volume. The RCA/I2S
+# zone (PCM5102A) has no playback mixer (softvol there causes static -- see
+# /etc/asound.conf), so RCA has NO OLED volume page at all. The Volume menu goes
+# straight to the Aux zone's ALSA volume.
 
+AUDIO_CARDS_ENV = "/run/innovo/audio-cards.env"
 VOLUME_STEP = 5            # percent per button press
-VOLUME_CARD = "0"          # card 0 = H3 codec = aux zone
+# Aux-zone ALSA volume control. Card is resolved at runtime from audio-cards.env
+# (the zone whose label is Aux); VOLUME_CONTROL is the codec's playback control.
+VOLUME_CARD = "0"          # fallback (H3 codec); overridden by _resolve_aux_card()
 VOLUME_CONTROL = "DAC"     # codec digital playback volume feeding aux Line Out
 
-# --- RCA (HiFi) zone: NO ALSA control by design (softvol on the PCM5102A I2S
-# path causes static -- see /etc/asound.conf). RCA volume is controlled
-# server-side in LMS instead, on the primary Squeezelite player.
-#
-# The LMS host and the RCA player id are PER-DEVICE: the player id is the
-# primary squeezelite player's MAC (its `-m` arg, == the board's eth0 MAC) and
-# the host is its `-s` arg. We auto-detect both from the running
-# `squeezelite-primary` (-o hifi) process so one script is correct on every
-# device; the constants below are only the fallback if detection fails.
-RCA_LMS_HOST = "192.168.0.68"
-RCA_LMS_PORT = 9000
-RCA_LMS_PLAYERID = "06:52:07:ba:4b:16"   # fallback primary (RCA/HiFi) player
-
-def _detect_rca_lms():
-    """Read the primary squeezelite cmdline and pull out its player MAC (-m)
-    and LMS server (-s). The primary player is the RCA/HiFi zone (-o hifi).
-    Returns (playerid, host) or (None, None) if not found."""
+def _read_audio_cards():
+    """Parse /run/innovo/audio-cards.env into a dict. RAM-only read (tmpfs /run),
+    no SD access. Returns {} if absent (falls back to card0=Aux single-zone)."""
+    d = {}
     try:
-        out = subprocess.check_output(
-            "ps -eo args 2>/dev/null | grep -E 'squeezelite[-]primary|squeezelite.*-o hifi' | grep -v grep",
-            shell=True, timeout=3).decode('utf-8', 'replace')
+        with open(AUDIO_CARDS_ENV, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                d[k.strip()] = v.strip().strip("'").strip('"')
     except Exception:
-        out = ""
-    playerid = host = None
-    for line in out.splitlines():
-        toks = line.split()
-        # -m is 6 space-separated hex bytes: -m 06 84 A7 E4 16 04
-        if '-m' in toks:
-            i = toks.index('-m')
-            mac = toks[i+1:i+7]
-            if len(mac) == 6 and all(len(b) == 2 for b in mac):
-                playerid = ':'.join(b.lower() for b in mac)
-        if '-s' in toks:
-            i = toks.index('-s')
-            if i + 1 < len(toks):
-                host = toks[i+1]
-        if playerid:
-            break
-    return playerid, host
+        pass
+    return d
 
-_pid, _host = _detect_rca_lms()
-if _pid:
-    RCA_LMS_PLAYERID = _pid
-if _host:
-    RCA_LMS_HOST = _host
-logging.info(f"RCA zone -> LMS {RCA_LMS_HOST}:{RCA_LMS_PORT} player {RCA_LMS_PLAYERID}")
+def get_zones():
+    """Return an ordered list of present zones as dicts:
+      {'n': 1, 'card': '0', 'label': 'Aux', 'has_volume': True}
+    derived from audio-cards.env. has_volume is True only for the Aux zone
+    (H3 codec has a playback mixer; RCA/I2S does not). Works for single (Aux
+    only) and dual (Aux+RCA)."""
+    env = _read_audio_cards()
+    zones = []
+    # Discover present ordinals from Z<N>_CARD keys; fall back to a single Aux z1.
+    ns = sorted(int(k[1]) for k in env if len(k) >= 3 and k[0] == 'Z'
+                and k[1].isdigit() and k.endswith('_CARD'))
+    if not ns:
+        ns = [1]
+    for n in ns:
+        card = env.get(f"Z{n}_CARD", "0")
+        label = env.get(f"Z{n}_LABEL", "Aux" if n == 1 else f"Zone {n}")
+        has_volume = (label.lower() == "aux")   # only the Aux/H3 codec has a mixer
+        zones.append({'n': n, 'card': card, 'label': label, 'has_volume': has_volume})
+    return zones
 
-_rca_level = 0
+def _resolve_aux_card():
+    """Card number of the Aux zone (the one with a usable ALSA volume). Falls back
+    to VOLUME_CARD if no Aux zone is found in audio-cards.env."""
+    for z in get_zones():
+        if z['has_volume']:
+            return z['card']
+    return VOLUME_CARD
+
+# Resolve the Aux card once at import; the codec card is stable for a boot.
+try:
+    VOLUME_CARD = _resolve_aux_card()
+except Exception:
+    pass
+logging.info(f"OLED volume: Aux zone ALSA card {VOLUME_CARD} control '{VOLUME_CONTROL}'")
 
 # ============================================================
 # Page indices (named so the handlers read clearly; no collisions)
@@ -101,12 +109,12 @@ PAGE_SHUTDOWN_CONFIRM = 5    # Shutdown? Yes/No
 PAGE_REBOOTING        = 7    # "Rebooting / please wait"
 PAGE_SHUTTING_DOWN    = 8    # "Shutting down / wait" -- CRITICAL shutdown-safety page
 PAGE_RESET_NET_CONFIRM = 9   # Reset Network? Yes/No
-AUX_VOLUME_PAGE       = 10   # Aux volume (amixer)
-RCA_VOLUME_PAGE       = 11   # RCA volume (LMS)
-RESET_AUDIO_PAGE      = 12   # Reset RCA / Reset Aux
+AUX_VOLUME_PAGE       = 10   # Aux zone ALSA volume (amixer) — the ONLY volume page
+RCA_VOLUME_PAGE       = 11   # RETIRED: RCA has no ALSA volume (n-zone); never navigated to
+RESET_AUDIO_PAGE      = 12   # Reset Audio (per-zone, n-zone aware; single/dual)
 FACTORY_CONFIRM_PAGE  = 13   # Factory Reset? Yes/No
 FACTORY_PROGRESS_PAGE = 14   # Factory reset running
-VOLUME_MENU_PAGE      = 15   # zone picker RCA/Aux
+VOLUME_MENU_PAGE      = 15   # RETIRED: RCA/Aux zone picker; Volume now goes straight to Aux
 # --- NEW ---
 POWER_RESET_MENU_PAGE  = 16  # submenu: Power & Reset (5 items)
 DIAGNOSTICS_MENU_PAGE  = 17  # submenu: Diagnostics (2 items)
@@ -140,13 +148,21 @@ I2S_RESET_SH = "/mnt/dietpi_userdata/innovo/app/backend/wrappers/i2s-reset.sh"
 FACTORY_RESET_SH = "/mnt/dietpi_userdata/innovo/app/backend/cgi-scripts/factory_reset.sh"
 RESET_NETWORK_SH = "/mnt/dietpi_userdata/innovo/app/backend/cgi-scripts/reset_network.sh"
 SELFHEAL_SH = "/usr/local/bin/innovo-self-heal.sh"
-AUX_SERVICES = ["squeezelite-secondary", "raspotify-secondary", "shairport-sync-secondary"]
-# Restart Audio (Diagnostics) restarts BOTH zones' player + streaming services.
-RESTART_AUDIO_SERVICES = [
-    "squeezelite-primary", "squeezelite-secondary",
-    "shairport-sync-primary", "shairport-sync-secondary",
-    "raspotify-primary", "raspotify-secondary",
-]
+
+# N-ZONE audio services. Player + streaming units are systemd TEMPLATE instances
+# squeezelite-z@N / shairport-sync-z@N / raspotify-z@N (NOT the old -primary/
+# -secondary units, which do not exist on an n-zone device — the old reset targeted
+# those and silently did nothing). Build the per-zone unit list from the zone number.
+def zone_audio_units(n):
+    """The three audio units for zone N (player + AirPlay + Spotify Connect)."""
+    return [f"squeezelite-z@{n}", f"shairport-sync-z@{n}", f"raspotify-z@{n}"]
+
+def all_audio_units():
+    """Every present zone's audio units (for Diagnostics -> Restart Audio)."""
+    units = []
+    for z in get_zones():
+        units += zone_audio_units(z['n'])
+    return units
 # Registration files (read-only status screen)
 DEVICE_IDENTITY_CONF = "/mnt/dietpi_userdata/innovo/config/device_identity.conf"
 MCAGENT_DEALER_TAG = "/mnt/dietpi_userdata/innovo/config/mcagentdealer.tag"
@@ -217,56 +233,54 @@ def change_volume(delta):
         logging.warning(f"change_volume failed: {e}")
     return _volume_level
 
-def _lms_request(params, timeout=4):
-    """POST a JSON-RPC slim.request to the LMS server. Returns the parsed
-    'result' dict, or None on any failure (network down, bad JSON, etc.)."""
-    import json, urllib.request
-    body = json.dumps({"id": 1, "method": "slim.request", "params": params}).encode()
-    url = f"http://{RCA_LMS_HOST}:{RCA_LMS_PORT}/jsonrpc.js"
+# NOTE: the RCA/HiFi zone has NO OLED volume control (no ALSA playback mixer on the
+# I2S/PCM5102A path). The former LMS-based RCA volume (_lms_request / get_rca_volume /
+# change_rca_volume) was removed with the RCA volume page. Aux volume is ALSA (amixer),
+# handled by change_volume()/get_volume() below.
+
+def _reset_zone_audio(zone):
+    """Reset one zone (n-zone aware): restart that zone's z@N player/stream units.
+    For an RCA (I2S) zone, also run the hardware I2S reset wrapper. `zone` is a dict
+    from get_zones()."""
+    n = zone['n']; label = zone['label']
+    units = zone_audio_units(n)
+    logging.info(f"Reset Audio: zone {n} ({label}) — restart {units}")
     try:
-        req = urllib.request.Request(url, data=body,
-                                     headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode()).get("result")
-    except Exception as e:
-        logging.warning(f"LMS request failed ({params}): {e}")
-        return None
-
-def get_rca_volume():
-    global _rca_level
-    res = _lms_request([RCA_LMS_PLAYERID, ["mixer", "volume", "?"]])
-    if res and "_volume" in res:
-        try:
-            _rca_level = int(float(res["_volume"]))
-        except (TypeError, ValueError):
-            pass
-    return _rca_level
-
-def change_rca_volume(delta):
-    """Adjust the RCA/HiFi zone volume via LMS server-side mixer (relative)."""
-    global _rca_level
-    sign = "+" if delta >= 0 else "-"
-    res = _lms_request([RCA_LMS_PLAYERID, ["mixer", "volume", f"{sign}{abs(delta)}"]])
-    # LMS doesn't echo the new level on a relative set; read it back.
-    return get_rca_volume()
-
-def reset_rca_audio():
-    """RCA/HiFi zone audio reset = re-run the I2S subsystem reset wrapper."""
-    logging.info("Reset Audio: RCA zone (i2s-reset.sh)")
-    try:
-        subprocess.Popen([I2S_RESET_SH],
+        subprocess.Popen(["systemctl", "restart"] + units,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
-        logging.error(f"i2s-reset failed to launch: {e}")
+        logging.error(f"zone {n} service restart failed: {e}")
+    # RCA/I2S zones also get the hardware I2S subsystem reset.
+    if label.lower() == "rca":
+        logging.info(f"Reset Audio: zone {n} (RCA) — i2s-reset.sh")
+        try:
+            subprocess.Popen([I2S_RESET_SH],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            logging.error(f"i2s-reset failed to launch: {e}")
+
+def _zone_by_label(label):
+    """Return the present zone dict whose label matches (case-insensitive), or None."""
+    for z in get_zones():
+        if z['label'].lower() == label.lower():
+            return z
+    return None
 
 def reset_aux_audio():
-    """Aux zone audio reset = restart the secondary-zone audio services."""
-    logging.info("Reset Audio: Aux zone (restart secondary services)")
-    try:
-        subprocess.Popen(["systemctl", "restart"] + AUX_SERVICES,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception as e:
-        logging.error(f"aux service restart failed to launch: {e}")
+    """Reset the Aux zone (always present on both single + dual)."""
+    z = _zone_by_label("Aux") or (get_zones()[0] if get_zones() else None)
+    if z:
+        _reset_zone_audio(z)
+    else:
+        logging.warning("Reset Aux: no Aux zone found")
+
+def reset_rca_audio():
+    """Reset the RCA zone (dual devices only; no-op on single/Aux-only)."""
+    z = _zone_by_label("RCA")
+    if z:
+        _reset_zone_audio(z)
+    else:
+        logging.info("Reset RCA: no RCA zone on this device (single/Aux-only) — skip")
 
 def run_factory_reset():
     """Trigger the device factory-reset script (detached -- it reboots)."""
@@ -290,11 +304,12 @@ def run_reset_network():
         logging.error(f"reset_network.sh failed to launch: {e}")
 
 def run_restart_audio():
-    """Diagnostics -> Restart Audio: restart squeezelite/shairport/raspotify
-    primary + secondary (detached, non-blocking)."""
-    logging.info("Diagnostics: Restart Audio (all player/stream services)")
+    """Diagnostics -> Restart Audio: restart every present zone's n-zone audio
+    units (squeezelite-z@N / shairport-sync-z@N / raspotify-z@N), detached."""
+    units = all_audio_units()
+    logging.info(f"Diagnostics: Restart Audio — {units}")
     try:
-        subprocess.Popen(["systemctl", "restart"] + RESTART_AUDIO_SERVICES,
+        subprocess.Popen(["systemctl", "restart"] + units,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
         logging.error(f"restart audio failed to launch: {e}")
@@ -330,10 +345,10 @@ def _selfheal_worker():
             timeout=600
         ).returncode
         _selfheal_result = rc
-        logging.info(f"Self-Heal finished rc={rc}")
+        logging.info(f"Repair System finished rc={rc}")
     except Exception as e:
         _selfheal_result = 1
-        logging.error(f"Self-Heal failed: {e}")
+        logging.error(f"Repair System failed: {e}")
 
 def run_self_heal():
     """Kick off the self-heal script in a background thread. Page 21 polls
@@ -346,7 +361,7 @@ def run_self_heal():
         t.start()
     except Exception as e:
         _selfheal_result = 1
-        logging.error(f"Self-Heal thread failed to start: {e}")
+        logging.error(f"Repair System thread failed to start: {e}")
 
 # --- Read-only filesystem detection + button-triggered repair ----------------
 # H3 SD cards occasionally corrupt on-card; ext4 detects a bad block (usually a
@@ -495,6 +510,8 @@ factory_confirm_last = 0.0      # time.time() of the last qualifying press
 
 # Update lock file path
 UPDATE_LOCK_FILE = "/tmp/innovo_update.lock"
+IR_OLED_MSG_FILE = "/tmp/ir-oled-msg"   # tmpfs RAM - transient IR feedback overlay
+IR_OLED_TTL = 5                          # seconds to show an IR message after a press
 
 # Initialize OLED
 oled.init()
@@ -666,12 +683,73 @@ def _get_dealer_name():
         pass
     return "N/A"
 
+def _get_version():
+    """Platform version from /innovo/version (e.g. '2.1'). Fallback 'N/A'."""
+    try:
+        with open("/mnt/dietpi_userdata/innovo/version", "r") as f:
+            v = f.read().strip()
+        return v if v else "N/A"
+    except Exception:
+        return "N/A"
+
+
+def _get_patch_level():
+    """Applied patch level from config/patch-level (e.g. '107'). Fallback '?'."""
+    try:
+        with open("/mnt/dietpi_userdata/innovo/config/patch-level", "r") as f:
+            p = f.read().strip()
+        return p if p else "?"
+    except Exception:
+        return "?"
+
+
+# The real device identity file lives under the backend cgi-bin tree, NOT the
+# config/ path in DEVICE_IDENTITY_CONF (that constant points at a non-existent
+# file -- see _is_registered). Use the correct path here.
+_IDENTITY_CONF_REAL = "/mnt/dietpi_userdata/innovo/app/backend/cgi-bin/device_identity.conf"
+
+
 def _get_device_id():
+    """Device identity hash suffix from the real device_identity.conf DEVICE_ID
+    (e.g. 'mc-playum-8931ba5efc41bebd' -> '8931ba5efc41bebd'). This is the
+    stable cloud identity. Previously this read registration.json's
+    serialNumber/activationCode, which are unpopulated pre-activation -> left
+    the OLED ID blank. Falls back to the activation serial, then 'N/A'."""
+    try:
+        with open(_IDENTITY_CONF_REAL, "r") as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("DEVICE_ID="):
+                    did = s.split("=", 1)[1].strip().strip('"').strip("'")
+                    if did:
+                        return did.rsplit("-", 1)[-1] if "-" in did else did
+    except Exception:
+        pass
     for field in ("serialNumber", "activationCode"):
         val = _reg_json_field(field)
         if val:
             return val
     return "N/A"
+
+
+def _ir_fresh_msg():
+    # Return the IR message string if /tmp/ir-oled-msg (tmpfs RAM) is fresh
+    # (age <= IR_OLED_TTL), else None. RAM-only read - no SD access.
+    try:
+        if not os.path.exists(IR_OLED_MSG_FILE):
+            return None
+        with open(IR_OLED_MSG_FILE, 'r') as irf:
+            _l = irf.read().split(chr(10))
+        _m = _l[0].strip() if _l else ''
+        _t = 0
+        if len(_l) > 1:
+            try: _t = int(_l[1].strip())
+            except: _t = 0
+        if _m and (time.time() - _t) <= IR_OLED_TTL:
+            return _m
+    except Exception:
+        pass
+    return None
 
 def draw_page():
     global drawing, pageSleepCountdown, lastActivityTime, screenSleeping, nowplaying_scroll_offset
@@ -682,8 +760,14 @@ def draw_page():
     sel_index = selectionIndex
     lock.release()
 
+    # WAKE-ON-IR: a fresh IR press must light a sleeping panel. Check BEFORE the
+    # screenSleeping early-return below (which would otherwise swallow the press).
+    if screenSleeping and _ir_fresh_msg() is not None:
+        try: wake_screen()
+        except Exception: pass
     if is_drawing or screenSleeping:
         return
+
 
     # Screensaver: sleep after pageSleep seconds of no button activity. Use a
     # WALL-CLOCK check (time since lastActivityTime) so the timeout is
@@ -722,6 +806,18 @@ def draw_page():
         drawing = False
         lock.release()
         return
+
+    # --- IR feedback overlay (RAM-only): show the last IR message for 5s ---
+    _irmsg = _ir_fresh_msg()
+    if _irmsg is not None:
+        draw.text((2, 20), 'IR REMOTE', font=font10, fill=255)
+        draw.text((2, 36), _irmsg[:20], font=fontb12, fill=255)
+        oled.drawImage(image)
+        lock.acquire()
+        drawing = False
+        lock.release()
+        return
+
 
     # --- Page 0: Date/Time + NowPlaying ---
     if page_index == PAGE_DATE:
@@ -843,6 +939,7 @@ def draw_page():
         draw.text((2, 16), f"Cloud:{cloud}  Reg:{reg}", font=font10, fill=255)
         draw.text((2, 28), f"Dealer:{dealer}", font=font10, fill=255)
         draw.text((2, 40), f"ID:{dev_id}", font=font10, fill=255)
+        draw.text((2, 52), f"Ver:{_get_version()} Patch:{_get_patch_level()}", font=font10, fill=255)
 
     # --- Page 2: System Options (top menu) ---
     elif page_index == SYSTEM_OPTIONS_PAGE:
@@ -934,14 +1031,13 @@ def draw_page():
             else:
                 draw.text((4, y+1), option, font=font10, fill=255)
 
-    # --- Page 15: Volume (zone picker) ---
+    # --- Page 15: Volume picker — RETIRED (RCA has no ALSA volume). Volume goes
+    # straight to the Aux page now. Kept as a defensive redirect in case something
+    # still lands here (draw the Aux page instead of a dead picker). ---
     elif page_index == VOLUME_MENU_PAGE:
-        draw.text((2, 2), 'Volume', font=fontb12, fill=255)
-        draw.text((4, 22), 'B1: RCA', font=font10, fill=255)
-        draw.text((4, 36), 'B2: Aux', font=font10, fill=255)
-        draw.text((4, 50), 'B3: Back', font=font10, fill=255)
+        update_page_index(AUX_VOLUME_PAGE)
 
-    # --- Page 10: Aux Volume ---
+    # --- Page 10: Aux Volume (the ONLY volume page) ---
     elif page_index == AUX_VOLUME_PAGE:
         draw.text((2, 2), 'Aux Volume', font=fontb12, fill=255)
         vol = get_volume()
@@ -955,20 +1051,16 @@ def draw_page():
             draw.rectangle((bx + 1, by + 1, bx + 1 + fill_w, by + bh - 1), outline=255, fill=255)
         draw.text((2, 50), 'B1 -  B2 +  B3 back', font=font10, fill=255)
 
-    # --- Page 11: RCA Volume (FIXED - no adjustment) ---
-    # The RCA/HiFi zone is raw I2S (PCM5102A) with no usable volume control, so
-    # the level is fixed. We keep the screen (so the zone picker stays symmetric)
-    # but show that it's fixed instead of a % + bar. B1/B2 do nothing here.
-    elif page_index == RCA_VOLUME_PAGE:
-        draw.text((2, 2), 'RCA Volume', font=fontb12, fill=255)
-        draw.text((2, 26), 'Volume is Fixed', font=fontb12, fill=255)
-        draw.text((2, 50), 'B3 back', font=font10, fill=255)
-
-    # --- Page 12: Reset Audio ---
+    # --- Page 12: Reset Audio (n-zone aware; single=Aux only, dual=RCA+Aux) ---
     elif page_index == RESET_AUDIO_PAGE:
         draw.text((2, 2), 'Reset Audio', font=fontb12, fill=255)
-        draw.text((4, 22), 'B1: Reset RCA', font=font10, fill=255)
-        draw.text((4, 36), 'B2: Reset Aux', font=font10, fill=255)
+        _has_rca = _zone_by_label("RCA") is not None
+        if _has_rca:
+            draw.text((4, 22), 'B1: Reset RCA', font=font10, fill=255)
+            draw.text((4, 36), 'B2: Reset Aux', font=font10, fill=255)
+        else:
+            # single (Aux-only): only the Aux reset is meaningful
+            draw.text((4, 22), 'B2: Reset Aux', font=font10, fill=255)
         draw.text((4, 50), 'B3: Back', font=font10, fill=255)
 
     # --- Page 13: Factory Reset confirmation ---
@@ -1125,15 +1217,11 @@ def receive_signal(signum, stack):
             update_page_index(STATUS_PAGE)
         elif page_index == STATUS_PAGE:
             update_page_index(PAGE_DATE)
-        # Volume picker: K1 = RCA zone.
-        elif page_index == VOLUME_MENU_PAGE:
-            update_page_index(RCA_VOLUME_PAGE)
         elif page_index == AUX_VOLUME_PAGE:
             change_volume(-VOLUME_STEP)              # Aux vol down
-        elif page_index == RCA_VOLUME_PAGE:
-            pass                                     # RCA volume is fixed - no-op
         elif page_index == RESET_AUDIO_PAGE:
-            reset_rca_audio()                        # K1 = Reset RCA
+            # K1 = Reset RCA (dual only; no-op/skip on single Aux-only)
+            reset_rca_audio()
             update_page_index(PAGE_DATE)
         draw_page()
 
@@ -1141,7 +1229,7 @@ def receive_signal(signum, stack):
         if page_index == SYSTEM_OPTIONS_PAGE:  # top menu
             choice = TOP_MENU[sel_index] if sel_index < len(TOP_MENU) else ""
             if choice == "Volume":
-                update_page_index(VOLUME_MENU_PAGE)
+                update_page_index(AUX_VOLUME_PAGE)   # straight to Aux (only volume zone)
             elif choice == "Power & Reset":
                 update_page_index(POWER_RESET_MENU_PAGE)
             elif choice == "Diagnostics":
@@ -1219,14 +1307,10 @@ def receive_signal(signum, stack):
                     pass
             else:  # No
                 update_page_index(PAGE_DATE)
-        elif page_index == VOLUME_MENU_PAGE:
-            update_page_index(AUX_VOLUME_PAGE)       # picker: K2 = Aux zone
         elif page_index == AUX_VOLUME_PAGE:
             change_volume(VOLUME_STEP)               # Aux vol up
-        elif page_index == RCA_VOLUME_PAGE:
-            pass                                     # RCA volume is fixed - no-op
         elif page_index == RESET_AUDIO_PAGE:
-            reset_aux_audio()                        # K2 = Reset Aux
+            reset_aux_audio()                        # K2 = Reset Aux (always present)
             update_page_index(PAGE_DATE)
         elif page_index == PAGE_RO_WARNING:          # K2 = Repair -> confirm
             update_page_index(PAGE_RO_FIX_CONFIRM)
@@ -1252,10 +1336,8 @@ def receive_signal(signum, stack):
             update_page_index(POWER_RESET_MENU_PAGE) # confirm/reset -> Power & Reset submenu
         elif page_index == SELFHEAL_PROGRESS_PAGE:
             update_page_index(DIAGNOSTICS_MENU_PAGE) # self-heal -> Diagnostics submenu
-        elif page_index in (AUX_VOLUME_PAGE, RCA_VOLUME_PAGE):
-            update_page_index(VOLUME_MENU_PAGE)      # zone page -> Volume picker
-        elif page_index == VOLUME_MENU_PAGE:
-            update_page_index(SYSTEM_OPTIONS_PAGE)   # Volume picker -> top menu
+        elif page_index == AUX_VOLUME_PAGE:
+            update_page_index(SYSTEM_OPTIONS_PAGE)   # Aux volume -> top menu (no picker)
         elif page_index == PAGE_RO_FIX_CONFIRM:
             update_page_index(PAGE_RO_WARNING)       # confirm -> back to warning
         elif page_index == PAGE_RO_WARNING:
